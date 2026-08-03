@@ -1,0 +1,20 @@
+# local Claude Code tooling — never committed
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Nothing else belongs here: em-server is STATELESS. If this file ever needs an
+# entry for uploads, a database or a session directory, that is the signal that
+# something has been added which breaks the 12-factor property — fix the code,
+# not the ignore list.
+
+# macOS
+.DS_Store

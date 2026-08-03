@@ -1,0 +1,190 @@
+# em-server
+
+**The s3Dgraphy access API, over HTTP.** A thin FastAPI wrapper around the same
+operations EMStudio's local bridge already calls — so a browser client can point at
+a service instead of a sidecar, with nothing else changed.
+
+Part of the StratiGraph ecosystem (CNR ISPC, Horizon Europe GA 101232855) with
+[s3Dgraphy](../s3Dgraphy) (the reference implementation), EMStudio, EM-blender-tools
+and EMLab.
+
+> **Status: P0 complete — read-only, local, no auth, everything under `/v1`.**
+> The scaffold and the read endpoints, verified in a container against the published
+> `s3dgraphy 1.6.0.dev12`. Authentication (Keycloak + ORCID), the asset store
+> (MinIO), the op-log WebSocket and the deployment on the shared infrastructure are
+> **P1–P4**, and they land with 3DR on Heriverse-Docker. See *Roadmap* below.
+
+## The two rules that shape this repo
+
+**1. FastAPI lives only here.** s3Dgraphy stays a pure library — no web framework,
+no transport, no server — and em-server is the one place that knows about HTTP. The
+corollary is the useful part: **em-server adds no logic.** Every endpoint is a call
+into `s3dgraphy.api`; if an operation needs to compute something, that something
+belongs in the library, where it is testable without a server and reusable by
+EMStudio, EMtools and EMLab. There is a test that reads `app/main.py` and fails if
+it ever reaches past the `api` surface into s3Dgraphy's internals.
+
+**2. Stateless (12-factor).** No session, no upload directory, no database: the
+document arrives in the request and leaves in the response. That is what makes
+replicas behind a load balancer safe, and it is a property to defend — the first
+endpoint that keeps a file on disk breaks it. (`.gitignore` says the same thing:
+if it ever needs an entry for uploads, fix the code, not the ignore list.)
+
+## Endpoints (P0)
+
+| endpoint | what it does | needs |
+|---|---|---|
+| `GET /v1/health` | liveness, version, **and `capabilities`** — which optional ops this build can actually perform, so a client never has to discover a 501 by trying | — |
+| `POST /v1/validate` | header/format conformance + stats (`api.validate`); load warnings travel in the response, not into a log the caller cannot read | — |
+| `POST /v1/export-ttl` | em.json → Turtle (`api.project_ttl`), `text/turtle` with the same filename the bridge uses | `rdflib` |
+| `POST /v1/reproject` | EPSG → EPSG (`api.reproject_many`); `{x, y, …}` or `{points: [[x, y], …]}` — one transformer per batch, capped at 512 points | `pyproj` |
+| `GET/POST /v1/resolve-authority` | ranked offline authority candidates; both verbs, like the bridge | authority snapshots |
+| `GET /health` | **unversioned probe alias** — same payload as `/v1/health` | — |
+
+### Versioning
+
+**`/v1` is the stable contract.** Route names and payloads under it do not move:
+3DR builds against this, and a path is the cheapest promise to keep. The
+multi-client WebSocket work of **P3 may introduce a `/v2`**, and it should appear
+*beside* `/v1` rather than replace it. An unprefixed API path is a 404, deliberately
+— a silently-aliased route is one that vanishes at v2 and takes a client with it.
+
+The one exception is `GET /health`, which also answers unversioned. A health probe
+belongs to the infrastructure, not to the API: a Docker `HEALTHCHECK`, a Kubernetes
+liveness probe and a Caddy upstream check must not need editing the day the API
+version changes. Same function, same payload, nothing to keep in sync.
+
+A missing optional dependency is **501 Not Implemented**, never 500: the request was
+valid and this build simply cannot do that op. A client can degrade honestly from a
+501 (that is exactly what EMStudio's map does when pyproj is absent) and cannot from
+a 500.
+
+`GET /docs` serves the interactive OpenAPI UI; `GET /openapi.json` is the contract
+to hand to 3DR for P1.
+
+## Run it
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'          # + '.[all]' for TTL and reprojection
+
+# s3dgraphy from PyPI — dev12 is the first release with `api.py` AND the extras
+.venv/bin/pip install 's3dgraphy[geo,rdf]==1.6.0.dev12'
+# …or from the sibling checkout, while the language and the service move together:
+# .venv/bin/pip install -e ../s3Dgraphy
+
+.venv/bin/uvicorn app.main:app --reload --port 8000
+curl -s localhost:8000/v1/health | python3 -m json.tool
+```
+
+Without s3dgraphy importable the app refuses to start and says how to fix it —
+deliberately, because a service that boots and then 500s on every request is worse
+than one that does not boot. (For a quick run against a checkout without
+installing: `PYTHONPATH=../s3Dgraphy/src .venv/bin/uvicorn app.main:app`.)
+
+### Docker
+
+```bash
+docker build -t em-server .
+docker run --rm -p 8000:8000 em-server
+curl -s localhost:8000/v1/health | python3 -m json.tool
+```
+
+Nothing to mount: the image installs `s3dgraphy[geo,rdf]==1.6.0.dev12` from PyPI and
+that is sufficient — verified in a real container (see below). To develop against a
+checkout instead, mount it and point `PYTHONPATH` at it:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v /path/to/s3Dgraphy/src:/opt/s3dgraphy-src:ro \
+  -e PYTHONPATH=/opt/s3dgraphy-src em-server
+```
+
+The image carries the optional engines by default (rdflib, pyproj): a service whose
+`/reproject` answers 501 is a support ticket waiting to happen, and pyproj bundles
+PROJ in its wheel so this needs no system GDAL. One uvicorn worker per container —
+replicas are the orchestrator's business, and a process count baked into an image
+is a decision taken in the wrong place.
+
+> **Why the pin is spelled `s3dgraphy[geo,rdf]==1.6.0.dev12`** — three lessons, each
+> learned from a build that failed:
+>
+> * `s3dgraphy>=1.6` matches **nothing** while 1.6 is a dev series: PEP 440 will not
+>   resolve a pre-release unless the specifier names one. The build died at pip.
+> * **dev12 is the first release shipping `s3dgraphy/api.py`**, the surface this
+>   whole service wraps. Anything older starts and fails the import (it says so, on
+>   purpose).
+> * The extras are **not** optional here in practice: dev11 predated `[geo]`, so
+>   `s3dgraphy[rdf,geo]` installed rdflib and silently skipped pyproj — pip warns
+>   about an unknown extra, it does not fail — and the container answered
+>   `reproject: false`. dev12 declares both, so the pin alone is now enough and the
+>   Dockerfile no longer names rdflib/pyproj separately.
+
+## Tests, and how P0 was verified
+
+```bash
+.venv/bin/python -m pytest tests -q      # 15 passed, 2 skipped
+```
+
+The tests skip rather than fail when an optional dependency is absent, and the
+inverse tests (501 without rdflib / without pyproj) run in that case instead — so
+the suite is meaningful in both builds.
+
+Beyond the endpoints, two properties are pinned: that `/export-ttl` returns
+**byte-for-byte** what `api.project_ttl` returns (the moment a service reshapes a
+result, "the same API over HTTP" stops being true), and that the app imports nothing
+from s3Dgraphy but `api`.
+
+**Checked in a real container** built from this Dockerfile, with **nothing mounted**
+— PyPI dev12 only:
+
+```
+GET  /v1/health      s3dgraphy 1.6.0.dev12, capabilities: validate ✓ export_ttl ✓
+                     reproject ✓ resolve_authority ✓
+GET  /health         200 — the unversioned probe answers the same
+POST /v1/reproject   lon 14.999999999999982, lat 41.99999995659526
+POST /reproject      404 — an unprefixed API route is not aliased
+POST /v1/export-ttl  7457 bytes, text/turtle, filename="portamarina_lite.ttl"
+```
+
+and the same TTL three ways, byte for byte:
+
+```
+the endpoint, in the container            7457 bytes
+api.project_ttl, in the same container    7457 bytes   → identical (no logic added)
+em-bridge, running the s3Dgraphy checkout 7457 bytes   → identical (dev12 == checkout)
+```
+
+The reprojection number is worth its own line: easting 500 000 in UTM zone 33 **is**
+the zone's central meridian (15°E) by definition, not by table lookup — so `lon
+15.000…` from inside the container is also proof that pyproj's PROJ data travelled
+with the wheel.
+
+The reprojection number is worth its own line: easting 500 000 in UTM zone 33 **is**
+the zone's central meridian (15°E) by definition, not by table lookup — so `lon
+15.000…` is also a proof that PROJ found its datum data.
+
+## Roadmap
+
+| phase | what | with |
+|---|---|---|
+| **P0** | this scaffold: read-only, local, no auth | — |
+| P1 | **Keycloak + ORCID** — the identity the rest of StratiGraph already uses | 3DR, shared infra |
+| P2 | **MinIO assets** — the same stable-ID resolver s3Dgraphy already has (R0–R2) | 3DR |
+| P3 | **op-log WebSocket** — ADR-002: one host per session now, CRDT later | — |
+| P4 | **deployment** (WP6) on Heriverse-Docker | 3DR |
+
+None of them is stubbed here. A placeholder endpoint gets called, and each phase
+carries a real decision — which identity provider, which bucket layout, which
+conflict policy — that is not ours alone to make.
+
+The mini-plan (`Regia_EM/em-server-mini-plan.md`) describes the **full** surface this
+service will eventually expose: GraphML ↔ em.json, the resource ops (list / resolve /
+ingest-minio / presign), DTC detach/inject/bake, `georeference_scene`, and the
+narrative generation seam. P0 carries the read-only subset on purpose — everything
+else either writes, or needs the asset store, or needs auth, and each of those is a
+phase with a decision attached. The list is the roadmap's, not a gap in P0.
+
+## License
+
+GPL-3.0-or-later, as the rest of the EM toolchain.
