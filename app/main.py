@@ -42,6 +42,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
+from .auth import AuthDependency, authenticator
+
 try:  # the whole point of the service; a clear failure beats a mysterious one
     from s3dgraphy import api as em
 except ImportError as exc:  # pragma: no cover — deployment error, not runtime
@@ -61,7 +63,21 @@ app = FastAPI(
 
 #: Every endpoint hangs off this router, so the prefix is declared once and cannot
 #: drift between routes. A future v2 is a second router beside it, not an edit.
-v1 = APIRouter(prefix="/v1")
+#:
+#: **P1: the router carries the auth dependency**, so protection is a property of
+#: the prefix rather than a decoration each route has to remember. A new endpoint
+#: is authenticated because of where it is declared — the opposite arrangement,
+#: where every handler opts in, is one forgotten line away from a public write op.
+v1 = APIRouter(prefix="/v1", dependencies=[AuthDependency])
+
+#: The two health routes live here instead, unauthenticated.
+#:
+#: Same prefix, no dependency: a probe is infrastructure. `/v1/health` is public
+#: for the same reason `/health` is — and, more to the point, because making the
+#: two paths of ONE function differ in security is how a misconfiguration hides.
+#: Neither leaks anything: a version string and which optional libraries were
+#: installed are things `docker inspect` already tells you.
+v1_public = APIRouter(prefix="/v1")
 
 
 # ── how optional dependencies are reported ────────────────────────────────────
@@ -101,9 +117,14 @@ class Health(BaseModel):
     #: which optional ops this build can actually perform. A client that reads
     #: this does not have to discover a 501 by trying.
     capabilities: Dict[str, bool] = Field(default_factory=dict)
+    #: `keycloak` when tokens are enforced, `dev-no-auth` when every /v1 route is
+    #: open. Reported because a warning that only exists in a log is a warning
+    #: nobody reads: this way "is this deployment actually protected?" is one
+    #: unauthenticated GET away, for the operator and for the client alike.
+    auth: str = "dev-no-auth"
 
 
-@v1.get("/health", response_model=Health, tags=["meta"])
+@v1_public.get("/health", response_model=Health, tags=["meta"])
 def health() -> Health:
     """Liveness, version, and what this build can do.
 
@@ -130,6 +151,7 @@ def health() -> Health:
             "reproject": importable("pyproj"),
             "resolve_authority": bool(em.authority_facets()),
         },
+        auth=authenticator.settings.describe(),
     )
 
 
@@ -277,6 +299,7 @@ def resolve_authority_post(req: AuthorityRequest) -> Dict[str, Any]:
     return _resolve_authority(req.term, req.facet)
 
 
+app.include_router(v1_public)
 app.include_router(v1)
 
 
@@ -292,13 +315,14 @@ def health_probe() -> Health:
     return health()
 
 
-# ── what P0 deliberately does NOT do ──────────────────────────────────────────
-# No write op, no upload, no asset store, no auth, no WebSocket. Each is a phase
-# of its own with a decision attached (which identity provider, which bucket
-# layout, which conflict policy), and shipping a placeholder for any of them would
-# be worse than the absence: a stub endpoint gets called.
+# ── what this build deliberately does NOT do ──────────────────────────────────
+# No write op, no upload, no asset store, no WebSocket. Each is a phase of its own
+# with a decision attached (which bucket layout, which conflict policy), and
+# shipping a placeholder for any of them would be worse than the absence: a stub
+# endpoint gets called.
 #
-#   P1 — Keycloak + ORCID (with 3DR, on the shared Heriverse-Docker infra)
+#   P1 — DONE: Keycloak bearer tokens on the shared realm (`app/auth.py`). ORCID as
+#        the user identity is configured in the realm, not here.
 #   P2 — MinIO assets: the same stable-ID resolver s3Dgraphy already has
 #   P3 — the op-log WebSocket (ADR-002: one host per session, CRDT later)
 #   P4 — deployment (WP6)

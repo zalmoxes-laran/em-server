@@ -62,6 +62,64 @@ a 500.
 `GET /docs` serves the interactive OpenAPI UI; `GET /openapi.json` is the contract
 to hand to 3DR for P1.
 
+## Auth (P1)
+
+em-server is a **resource server**: it never logs anybody in. A client gets an
+access token from the shared Keycloak realm — the one Heriverse-Server already uses
+— and sends it as `Authorization: Bearer <jwt>`. Every request is verified against
+the realm's published JWKS; there is no session, which is what keeps the service
+horizontally scalable.
+
+**Everything under `/v1` requires a token. Both health routes do not** — a probe is
+infrastructure, and a Docker `HEALTHCHECK` must not start failing the day auth is
+switched on. `GET /health` reports `auth: "keycloak"` or `auth: "dev-no-auth"`, so
+"is this deployment actually protected?" is one unauthenticated GET away.
+
+### Environment
+
+| variable | meaning |
+|---|---|
+| `TOKEN_ENDPOINT` | the realm's token endpoint, **already deployed by Heriverse-Docker**. The issuer and the JWKS URI are derived from it |
+| `CLIENT_ID_em` | the audience this service accepts, following Heriverse's own `CLIENT_ID_<app>` convention |
+| `OIDC_ISSUER` | explicit issuer, if you would rather not derive it |
+| `OIDC_AUDIENCE` | explicit audience; wins over `CLIENT_ID_em` |
+| `OIDC_JWKS_URI` | explicit JWKS URI; defaults to `<issuer>/protocol/openid-connect/certs` |
+| `OIDC_REQUIRED_SCOPE` | space-separated scopes a token must carry (optional) |
+| `EM_SERVER_ALLOW_ANON` | `1` to state the local open mode deliberately. **Ignored** when OIDC is configured |
+
+The derivation is the alignment that matters: 3DR already sets `TOKEN_ENDPOINT`, so
+em-server must not ask for a second spelling of the same realm URL. Two variables
+for one fact is how configurations drift until one of them is wrong. It works with
+both Keycloak path styles (`/auth/realms/…` for ≤16, `/realms/…` for 17+) because
+the endpoint's fixed suffix is stripped rather than the prefix guessed.
+
+```bash
+# the shared realm
+TOKEN_ENDPOINT=http://keycloak:8080/auth/realms/heriverse/protocol/openid-connect/token
+CLIENT_ID_em=em
+```
+
+### Three states, and the middle one is the point
+
+* **enforcing** — issuer and audience known: `/v1` needs a valid token. 401 for
+  missing / expired / badly signed / wrong issuer; **403** for a wrong audience or a
+  missing scope, because that token is genuine and re-authenticating cannot fix it.
+* **dev / no-auth** — *nothing* OIDC is set: P0 keeps working on a laptop, with a
+  loud warning in the log and `auth: "dev-no-auth"` in `/health`.
+* **misconfigured** — *some* of it set: the process **refuses to start**. A
+  half-configured deployment that fell back to open would be a service everyone
+  believes is protected, and that failure is silent, permanent, and found by the
+  wrong person.
+
+### What is still needed from 3DR
+
+The end-to-end run against the real realm needs the shared configuration:
+the realm's public URL as reachable from em-server's container, a **client for
+em-server** in that realm, and — the one that bites — an **audience mapper** on it,
+because Keycloak does not put a client's own id in `aud` by default. Without the
+mapper a genuine token arrives with `aud: account` and is correctly refused with a
+403. See the mail-spec to Romano (realm + bucket + routing).
+
 ## Run it
 
 ```bash
@@ -169,7 +227,7 @@ the zone's central meridian (15°E) by definition, not by table lookup — so `l
 | phase | what | with |
 |---|---|---|
 | **P0** | this scaffold: read-only, local, no auth | — |
-| P1 | **Keycloak + ORCID** — the identity the rest of StratiGraph already uses | 3DR, shared infra |
+| **P1** | **Keycloak** bearer-token auth on the shared realm — done, verified against a locally signed realm; the run against the real one needs 3DR's config (see *Auth* above). **ORCID** as user identity is a realm-side concern, so it lands with that config rather than here | 3DR, shared infra |
 | P2 | **MinIO assets** — the same stable-ID resolver s3Dgraphy already has (R0–R2) | 3DR |
 | P3 | **op-log WebSocket** — ADR-002: one host per session now, CRDT later | — |
 | P4 | **deployment** (WP6) on Heriverse-Docker | 3DR |

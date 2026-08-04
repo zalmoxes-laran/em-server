@@ -37,8 +37,12 @@ COPY pyproject.toml README.md ./
 # skipped pyproj (pip warns about an unknown extra, it does not fail) and the
 # image answered `reproject: false`. dev12 declares both extras, so the pin alone
 # is enough — verified in the container, not assumed.
+# PyJWT[crypto] is here and NOT behind a build arg on purpose: an image that
+# cannot verify a token is an image that would come up in the open dev mode on
+# the shared infrastructure. The auth dependency is not optional (P1).
 RUN pip install --upgrade pip && \
-    pip install "${S3DGRAPHY_SPEC}" "fastapi>=0.110" "uvicorn[standard]>=0.27"
+    pip install "${S3DGRAPHY_SPEC}" "fastapi>=0.110" "uvicorn[standard]>=0.27" \
+                "PyJWT[crypto]>=2.8"
 
 COPY app ./app
 

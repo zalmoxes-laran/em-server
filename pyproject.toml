@@ -30,6 +30,18 @@ dependencies = [
     "s3dgraphy[geo,rdf]==1.6.0.dev12",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    # P1 auth: verify the realm's RS256 tokens against its published JWKS.
+    #
+    # A HARD dependency, not an extra, and deliberately so: making auth optional
+    # would mean a build that cannot enforce it, and the failure mode of *that* is
+    # a deployment which comes up open because the wheel was thin. 31 KB for PyJWT
+    # plus `cryptography`, which the TLS stack already pulls in.
+    #
+    # PyJWT and not python-jose: one library, actively maintained, and the JWKS
+    # handling is a few lines here rather than a second framework. `[crypto]`
+    # brings the RSA/EC backend — without it PyJWT can only do HMAC, which is
+    # exactly the algorithm we refuse.
+    "PyJWT[crypto]>=2.8",
 ]
 
 [project.optional-dependencies]

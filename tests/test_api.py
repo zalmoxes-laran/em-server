@@ -17,14 +17,9 @@ import sys
 
 import pytest
 
+# The import paths (repo root + the s3Dgraphy checkout ahead of any wheel) are set
+# by tests/conftest.py, which runs before this module is imported.
 _REPO = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO))
-
-# The s3Dgraphy checkout wins over an installed wheel: em-server is developed
-# against the reference implementation as it is now.
-_CHECKOUT = _REPO.parent / "s3Dgraphy" / "src"
-if _CHECKOUT.is_dir():
-    sys.path.insert(0, str(_CHECKOUT))
 
 pytest.importorskip("fastapi", reason="needs the [dev] extra")
 pytest.importorskip("httpx", reason="needs the [dev] extra")
@@ -37,7 +32,8 @@ from app.main import app  # noqa: E402
 
 client = TestClient(app)
 
-FIXTURE = _CHECKOUT.parent / "tests" / "fixtures" / "PortaMarina-lite.em.json"
+FIXTURE = (_REPO.parent / "s3Dgraphy" / "tests" / "fixtures"
+           / "PortaMarina-lite.em.json")
 
 
 def _doc():
