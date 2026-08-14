@@ -152,10 +152,13 @@ def test_4_the_asset_module_adds_no_logic():
             "assets.py is a byte store: it must not know what a graph is"
 
 
-def test_4b_the_production_store_is_named_and_honest():
+def test_4b_the_production_store_is_named_and_real():
     source = (_REPO / "app" / "assets.py").read_text(encoding="utf-8")
     assert "class MinioAssetStore" in source, "the deployment target is named"
-    assert "NotImplementedError" in source, "…and it fails with a sentence"
+    for method in ("def put", "def get", "def head"):
+        assert method in source
+    # it is the same class the deployment runs — not a dev double beside it
+    assert "class MinioAssetStore" in source and "moto" not in source
 
 
 def test_4c_health_says_where_the_bytes_live(client):
@@ -164,15 +167,50 @@ def test_4c_health_says_where_the_bytes_live(client):
     assert payload["asset_store"].startswith(("memory", "directory", "minio"))
 
 
-def test_an_object_store_it_cannot_serve_stops_the_process():
-    """STEP 5 · the deploy declares MinIO before the implementation exists.
+# ── 5 · choosing a store, and refusing a half-chosen one ────────────────────
 
-    A process that read that configuration and quietly wrote to a local
-    directory instead would look healthy while putting the institution's assets
-    somewhere nobody backs up — silent until it is expensive.
+def test_5_a_half_configured_object_store_stops_the_process():
+    """The most important assertion in this file.
+
+    A process given three of the four MinIO settings must NOT quietly fall back
+    to a local directory: it would look healthy while putting the institution's
+    assets somewhere nobody backs up — silent until it is expensive. Same rule
+    `auth.py` applies to a half-configured realm.
     """
-    with pytest.raises(NotImplementedError) as exc:
-        assets.asset_store_from_env({"EM_ASSET_S3_ENDPOINT": "http://minio:9000",
-                                     "EM_ASSET_DIR": "/srv/em-data/assets"})
-    assert "not implemented" in str(exc.value)
-    assert "EM_ASSET_DIR" in str(exc.value)      # …and says what to do instead
+    with pytest.raises(RuntimeError) as exc:
+        assets.asset_store_from_env({
+            "MINIO_ENDPOINT": "http://minio:9000",
+            "MINIO_ACCESS_KEY": "key",
+            "MINIO_BUCKET": "em-assets",          # …and no secret
+            "EM_ASSET_DIR": "/srv/em-data/assets",
+        })
+    message = str(exc.value)
+    assert "half configured" in message
+    assert "secret_key" in message                # says WHICH one is missing
+    assert "MINIO_BUCKET" in message              # …and what the four are
+
+
+def test_5b_nothing_configured_is_memory_and_a_directory_is_a_directory(tmp_path):
+    """The two non-deployment stores stay exactly as they were."""
+    assert isinstance(assets.asset_store_from_env({}), InMemoryAssetStore)
+    store = assets.asset_store_from_env({"EM_ASSET_DIR": str(tmp_path)})
+    assert isinstance(store, DirectoryAssetStore)
+
+
+def test_5c_the_ansible_spelling_of_the_settings_is_understood():
+    """Two names for one setting, with a precedence — not two settings that will
+    one day disagree. The Ansible role writes `EM_ASSET_S3_*`; MinIO's own docs
+    and the dev stack use `MINIO_*`."""
+    settings = assets._minio_settings({
+        "EM_ASSET_S3_ENDPOINT": "https://minio.example.org",
+        "EM_ASSET_S3_ACCESS_KEY": "key",
+        "EM_ASSET_S3_SECRET_KEY": "secret",
+        "EM_ASSET_S3_BUCKET": "em-assets",
+    })
+    assert settings["endpoint"] == "https://minio.example.org"
+    assert settings["secure"] is True, "https means TLS without being told"
+    plain = assets._minio_settings({
+        "MINIO_ENDPOINT": "http://minio:9000", "MINIO_ACCESS_KEY": "k",
+        "MINIO_SECRET_KEY": "s", "MINIO_BUCKET": "b"})
+    assert plain["secure"] is False, "http means somebody chose plain HTTP"
+    assert assets._minio_settings({}) is None

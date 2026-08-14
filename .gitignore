@@ -16,5 +16,11 @@ dist/
 # something has been added which breaks the 12-factor property — fix the code,
 # not the ignore list.
 
+# The dev-stack's FILLED-IN environment. `.env.dev.example` is committed (it is
+# documentation and its values are deliberately worthless); the copy somebody
+# edits is not, because the day it stops holding `minioadmin` is the day it
+# holds something real.
+dev-stack/.env.dev
+
 # macOS
 .DS_Store

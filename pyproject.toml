@@ -51,6 +51,11 @@ dependencies = [
 rdf = ["s3dgraphy[rdf]==1.6.0.dev12"]      # /v1/export-ttl
 geo = ["s3dgraphy[geo]==1.6.0.dev12"]      # /v1/reproject (pyproj bundles PROJ)
 all = ["s3dgraphy[rdf,geo]==1.6.0.dev12"]
+# The object store. Optional because a deployment that keeps its assets on a
+# volume (one instance, `EM_ASSET_DIR`) does not need an S3 client — and because
+# a missing client must fail at construction with a sentence, which is only
+# possible if it is allowed to be missing.
+s3 = ["minio>=7.2"]
 dev = ["pytest>=7", "httpx>=0.27"]
 
 [tool.setuptools]

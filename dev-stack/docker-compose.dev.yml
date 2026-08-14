@@ -1,0 +1,131 @@
+# The DEV stack: MinIO + Keycloak + em-server, on a laptop.
+#
+# NOT a second deployment path. The real server — a local FCN and an
+# institutional node are the same service — is provisioned with the Ansible /
+# compose of production (heriverse-ansible). What runs here is the SAME
+# em-server image, the SAME wire, and the SAME MinIO implementation of the
+# AssetStore. This file only puts the two things it depends on next to it, so
+# the promotion arc can be exercised against a REAL object store without a
+# remote host.
+#
+#   docker compose --env-file .env.dev -f docker-compose.dev.yml up -d --build
+#
+# Credentials come from `.env.dev` (copy `.env.dev.example`). They are DEV ONLY:
+# the production secrets come from the Ansible defaults / Vault, and nothing in
+# this directory is ever a source of them.
+
+name: em-dev
+
+services:
+  # =======================================================================
+  # OBJECT STORE — where the assets actually live (content-addressed)
+  # =======================================================================
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: em-dev-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      # the readiness endpoint, not a port check: a listening socket is not a
+      # store that will accept an object
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # A one-shot: create the bucket, then exit. em-server would create it itself
+  # (its `_ensure_bucket`), but doing it here means the bucket exists before the
+  # first request even if em-server is started with credentials that are not
+  # allowed to create buckets — which is what production looks like.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: em-dev-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set dev http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+        mc mb --ignore-existing dev/$$MINIO_BUCKET &&
+        mc ls dev &&
+        echo 'bucket ready: '$$MINIO_BUCKET
+      "
+    restart: "no"
+
+  # =======================================================================
+  # IDENTITY — the same realm mechanism as production, seeded so a token is a
+  # curl away instead of a click-through
+  # =======================================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    container_name: em-dev-keycloak
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+    environment:
+      KEYCLOAK_ADMIN: "${KEYCLOAK_ADMIN}"
+      KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD}"
+    ports:
+      - "${KEYCLOAK_PORT:-8085}:8080"
+    volumes:
+      - ./keycloak/realm-em-dev.json:/opt/keycloak/data/import/realm-em-dev.json:ro
+    healthcheck:
+      # Keycloak 24 has no curl in the image; this is the shell's own /dev/tcp
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/em-dev HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | head -1 | grep -q '200'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  # =======================================================================
+  # THE ROOM — built from em-server's own Dockerfile, unchanged
+  # =======================================================================
+  em-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: em-server:dev
+    container_name: em-dev-server
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # --- identity: the realm this dev stack seeds --------------------------
+      # The issuer is what the TOKEN says it is. Inside the compose network
+      # Keycloak is `keycloak:8080`, but a token minted through the host port
+      # carries `http://localhost:<port>` — so the issuer is the HOST spelling
+      # and the JWKS is fetched over the internal one. Getting this pair wrong
+      # is the classic "token refused, and both sides look right".
+      OIDC_ISSUER: "http://localhost:${KEYCLOAK_PORT:-8085}/realms/${DEV_REALM}"
+      OIDC_JWKS_URI: "http://keycloak:8080/realms/${DEV_REALM}/protocol/openid-connect/certs"
+      OIDC_AUDIENCE: "${DEV_CLIENT_ID}"
+      # --- the object store: the PRODUCTION implementation -------------------
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+      MINIO_SECURE: "false"
+      # --- room documents ----------------------------------------------------
+      EM_SNAPSHOT_DIR: "/srv/em-data/snapshots"
+    ports:
+      - "${EM_SERVER_PORT:-8000}:8000"
+    volumes:
+      - em_data:/srv/em-data
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+  em_data:

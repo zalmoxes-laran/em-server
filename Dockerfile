@@ -40,15 +40,26 @@ COPY pyproject.toml README.md ./
 # PyJWT[crypto] is here and NOT behind a build arg on purpose: an image that
 # cannot verify a token is an image that would come up in the open dev mode on
 # the shared infrastructure. The auth dependency is not optional (P1).
+# `minio` is here and not behind a build arg for the same reason PyJWT is: an
+# image that cannot reach the object store would come up serving assets from a
+# container filesystem that disappears with the container. 400 KB.
 RUN pip install --upgrade pip && \
     pip install "${S3DGRAPHY_SPEC}" "fastapi>=0.110" "uvicorn[standard]>=0.27" \
-                "PyJWT[crypto]>=2.8"
+                "PyJWT[crypto]>=2.8" "minio>=7.2"
 
 COPY app ./app
 
-# Not root. There is nothing to write, so there is no reason to be able to.
+# Not root. The application writes nothing inside the image, so there is no
+# reason to be able to.
+#
+# /srv/em-data is created here even though it is empty: a named volume mounted
+# on a path the image does NOT have is created root-owned, and a non-root
+# process then cannot write its first snapshot. Creating it with the right owner
+# is what makes `volumes: [em_data:/srv/em-data]` work — in the dev stack and in
+# the Ansible compose, which mounts exactly the same path.
 RUN useradd --create-home --shell /usr/sbin/nologin emserver && \
-    chown -R emserver:emserver /srv/em-server
+    mkdir -p /srv/em-data && \
+    chown -R emserver:emserver /srv/em-server /srv/em-data
 USER emserver
 
 EXPOSE 8000
