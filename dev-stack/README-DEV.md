@@ -160,3 +160,42 @@ between sessions.
 
 Colima 0.10.3 · Docker 29.6.1 · docker-compose 5.3.0 (standalone) ·
 MinIO (latest, 2026-08) · Keycloak 24.0.4 · macOS aarch64.
+
+---
+
+## The image layer (IIIF)
+
+The stack also runs **Cantaloupe**, a IIIF Image API server, reading the **same
+MinIO bucket** with the asset's `sha256` as the identifier. Nothing is copied,
+nothing is imported, and there is no thumbnail pipeline: a thumbnail is a size
+request, a deep-zoom tile is a region request, and the crop of an annotated
+region is a URL.
+
+```bash
+HEX=<the sha256 of an uploaded image>            # the `sha256` field of the PUT answer
+curl -s http://localhost:8182/iiif/3/$HEX/info.json | jq '{width, height, profile}'
+open  "http://localhost:8182/iiif/3/$HEX/full/!400,400/0/default.jpg"   # thumbnail
+open  "http://localhost:8182/iiif/3/$HEX/pct:10,10,30,20/max/0/default.jpg"  # a region
+```
+
+Two spellings that are **measured, not guessed** (both cost an afternoon):
+
+* the size `full` is deprecated in Image API 3 — Cantaloupe answers **400**. Use
+  `max`;
+* any size **above** the source is also a 400, including the `!w,h` confine form
+  and the `^` upscale form. So a thumbnail asks `!400,400` (at most this big) and
+  a viewer asks `max` until `info.json` tells it how big the image really is.
+
+```bash
+python dev-stack/smoke_iiif.py     # the whole arc, measured
+```
+
+It uploads an image, checks Cantaloupe serves `info.json` / a thumbnail / a
+region crop for it, puts a graph with two annotation regions into a room through
+the op stream, and asks em-server for the **IIIF Presentation manifest** — whose
+canvas is sized from the real `info.json` and whose annotations are the graph's
+regions as **W3C Web Annotations**.
+
+**In EMStudio**: Settings → *Immagini (IIIF)* → `http://localhost:8182/iiif/3`.
+The shelf and the resource cards then show thumbnails, and the annotator loads
+the picture through the Image API.

@@ -64,6 +64,68 @@ services:
     restart: "no"
 
   # =======================================================================
+  # IIIF IMAGE API — Cantaloupe, reading straight from the bucket
+  # =======================================================================
+  #
+  # It takes its images from MinIO with the **digest as the identifier**, which
+  # is the whole reason this is cheap: the assets are already content-addressed,
+  # so no second copy, no import step, no thumbnail pipeline to keep in sync.
+  #
+  # What it buys, and none of it is code we write: thumbnails (a size request),
+  # deep zoom (tiles), region delivery (an annotation's crop, served), and
+  # interoperability with every IIIF viewer there is.
+  cantaloupe:
+    image: islandora/cantaloupe:main
+    container_name: em-dev-cantaloupe
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      CANTALOUPE_HTTP_ENABLED: "true"
+      CANTALOUPE_HTTP_HOST: "0.0.0.0"
+      CANTALOUPE_HTTP_PORT: "8182"
+      CANTALOUPE_HTTPS_ENABLED: "false"
+      # Image API 3 is what the manifests and the viewers speak; 2 stays on
+      # because Mirador and older clients still ask for it.
+      CANTALOUPE_ENDPOINT_IIIF_3_ENABLED: "true"
+      CANTALOUPE_ENDPOINT_IIIF_2_ENABLED: "true"
+      CANTALOUPE_ENDPOINT_IIIF_1_ENABLED: "false"
+      CANTALOUPE_ENDPOINT_ADMIN_ENABLED: "false"
+      CANTALOUPE_ENDPOINT_API_ENABLED: "false"
+      CANTALOUPE_ENDPOINT_HEALTH_ENABLED: "true"
+      # --- the source: the SAME bucket em-server writes to -------------------
+      CANTALOUPE_SOURCE_STATIC: "S3Source"
+      CANTALOUPE_S3SOURCE_ENDPOINT: "http://minio:9000"
+      CANTALOUPE_S3SOURCE_ACCESS_KEY_ID: "${MINIO_ROOT_USER}"
+      CANTALOUPE_S3SOURCE_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      CANTALOUPE_S3SOURCE_REGION: "us-east-1"
+      CANTALOUPE_S3SOURCE_LOOKUP_STRATEGY: "BasicLookupStrategy"
+      CANTALOUPE_S3SOURCE_BASICLOOKUPSTRATEGY_BUCKET_NAME: "${MINIO_BUCKET}"
+      # NO path prefix and NO suffix: the IIIF identifier IS the sha256 hex,
+      # which is exactly the object's key. One name for one thing.
+      CANTALOUPE_S3SOURCE_BASICLOOKUPSTRATEGY_PATH_PREFIX: ""
+      CANTALOUPE_S3SOURCE_BASICLOOKUPSTRATEGY_PATH_SUFFIX: ""
+      # --- processing --------------------------------------------------------
+      CANTALOUPE_PROCESSOR_SELECTION_STRATEGY: "AutomaticSelectionStrategy"
+      # Derivatives are a CACHE, not data: they can always be recomputed from
+      # the asset, so losing them costs time and nothing else.
+      #
+      # OFF here, and MEASURED rather than assumed: with the filesystem
+      # derivative cache on, this image answers 200 with a **zero-byte body**
+      # (the log shows `InfoService putInCachesAsync(): /var/cache/cantaloupe/info`
+      # and every image comes back empty). A silently empty image is the worst
+      # kind of wrong, so the cache stays off until a deployment configures one
+      # it can verify.
+      CANTALOUPE_CACHE_SERVER_DERIVATIVE_ENABLED: "false"
+      CANTALOUPE_CACHE_SERVER_INFO_ENABLED: "false"
+      CANTALOUPE_LOG_APPLICATION_LEVEL: "info"
+    ports:
+      - "${CANTALOUPE_PORT:-8182}:8182"
+    volumes:
+      - cantaloupe_cache:/var/cache/cantaloupe
+    restart: unless-stopped
+
+  # =======================================================================
   # IDENTITY — the same realm mechanism as production, seeded so a token is a
   # curl away instead of a click-through
   # =======================================================================
@@ -120,12 +182,34 @@ services:
       MINIO_SECURE: "false"
       # --- room documents ----------------------------------------------------
       EM_SNAPSHOT_DIR: "/srv/em-data/snapshots"
+      # --- images -------------------------------------------------------------
+      # Where clients should be sent for pixels. The manifest carries URLs that
+      # OTHER people's viewers will fetch, so it must name a host they can reach
+      # — `localhost` here, the public name behind the production proxy.
+      EM_IIIF_BASE: "http://localhost:${CANTALOUPE_PORT:-8182}/iiif/3"
+      # …and how em-server ITSELF reaches that image server, to read info.json
+      # and learn each image's real size. Not the same address: inside this
+      # network `localhost` is em-server. Without this every canvas would get a
+      # placeholder size and the manifest would say so — measured, not guessed.
+      EM_IIIF_INTERNAL_BASE: "http://cantaloupe:8182/iiif/3"
+      # The dev stack runs the LIBRARY YOU ARE EDITING: the sibling s3Dgraphy
+      # checkout is mounted and put first on the path. If it is not there the
+      # mount is an empty directory and the image's pinned wheel is used instead
+      # — so this is a convenience, never a requirement.
+      PYTHONPATH: "/srv/s3dgraphy-src"
     ports:
       - "${EM_SERVER_PORT:-8000}:8000"
     volumes:
       - em_data:/srv/em-data
+      # The dev stack runs the CODE YOU ARE EDITING, on both sides of the line:
+      # em-server's own app and the sibling s3Dgraphy checkout. Without the first
+      # one, an edit to a route is invisible until the image is rebuilt — which
+      # is discovered as a 404 on an endpoint that plainly exists.
+      - ../app:/srv/em-server/app:ro
+      - ../../s3Dgraphy/src:/srv/s3dgraphy-src:ro
     restart: unless-stopped
 
 volumes:
   minio_data:
   em_data:
+  cantaloupe_cache:   # derivatives: a cache, recomputable — not study data

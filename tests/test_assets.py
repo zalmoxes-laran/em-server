@@ -214,3 +214,36 @@ def test_5c_the_ansible_spelling_of_the_settings_is_understood():
         "MINIO_SECRET_KEY": "s", "MINIO_BUCKET": "b"})
     assert plain["secure"] is False, "http means somebody chose plain HTTP"
     assert assets._minio_settings({}) is None
+
+
+# ── 6 · the IIIF manifest: read by VIEWERS, not only by programs ────────────
+
+def test_6_the_manifest_route_is_authenticated_but_reachable_by_a_viewer():
+    """A manifest exists to be opened by somebody else's software.
+
+    Mirador fetches the URL itself and cannot be asked to set a header, so the
+    token is accepted in the query as well — the same decision the WebSocket
+    already makes, and for the same reason. What must NOT change is that a
+    request with no token at all is refused: the manifest describes somebody's
+    study.
+    """
+    from app.main import app as fastapi_app
+
+    # the OpenAPI schema, not `app.routes`: this FastAPI wraps an included
+    # router in an object with no `.path`, so walking the route list quietly
+    # finds nothing at all
+    manifest = "/v1/rooms/{room_id}/iiif/{target_id}/manifest"
+    assert manifest in fastapi_app.openapi()["paths"]
+
+    source = (_REPO / "app" / "main.py").read_text(encoding="utf-8")
+    # it hangs off the router WITHOUT the blanket dependency, and does the check
+    # itself — otherwise the query token never reaches the handler
+    assert f'@v1_public.get("{manifest.removeprefix("/v1")}"' in source
+    assert "_authorise_manifest" in source
+    assert "Access-Control-Allow-Origin" in source, \
+        "a viewer fetching from its own origin needs CORS on this route"
+
+
+def test_6b_a_manifest_request_without_a_token_is_refused(client):
+    answer = client.get("/v1/rooms/scavo/iiif/img-1/manifest")
+    assert answer.status_code in (401, 503), answer.text

@@ -234,6 +234,143 @@ def get_asset(room_id: str, ref: str) -> Response:
                     headers={"ETag": f'"{ref}"'})
 
 
+# ── IIIF: the manifest of a room's image or document ──────────────────────────
+
+#: The Image API base CLIENTS should be sent to. The manifest carries URLs other
+#: people's viewers will fetch, so it must name a host they can reach: in the dev
+#: stack that is Cantaloupe on localhost, behind the production proxy it is
+#: `https://<host>/iiif/3`.
+IIIF_BASE = (os.environ.get("EM_IIIF_BASE") or "").rstrip("/")
+
+#: …and how THIS PROCESS reaches the same image server, which is not the same
+#: address. Inside a compose network `localhost` is em-server itself, so a server
+#: that fetched `info.json` from the public base would silently measure nothing
+#: and every canvas would get a placeholder size. Same split as `OIDC_ISSUER`
+#: (what the token says) versus `OIDC_JWKS_URI` (where we go to check it), and it
+#: goes wrong the same way: both sides look right and the result is quietly poor.
+IIIF_INTERNAL_BASE = (os.environ.get("EM_IIIF_INTERNAL_BASE")
+                      or IIIF_BASE).rstrip("/")
+
+
+# On the router WITHOUT the blanket auth dependency, and doing the check itself:
+# a viewer cannot set a header, so the token has to be allowed in the query — and
+# a router-level dependency refuses the request before the handler can look.
+@v1_public.get("/rooms/{room_id}/iiif/{target_id}/manifest", tags=["iiif"])
+async def iiif_manifest(room_id: str, target_id: str, request: Request,
+                        response: Response,
+                        image_base: Optional[str] = Query(default=None),
+                        token: Optional[str] = Query(default=None)
+                        ) -> Dict[str, Any]:
+    """A IIIF Presentation 3 manifest for an image or a document in this room.
+
+    The graph is the source and the manifest is a view of it — built by
+    `s3dgraphy.api.iiif_manifest`, because that is where the logic belongs
+    (rule #1). What em-server adds is the two things a library must not do:
+
+    * it knows the deployment's **public** Image API base;
+    * it can **fetch `info.json`** to learn each image's pixel size. A library
+      that made HTTP calls would be untestable and would break offline; a server
+      that refused to would emit canvases with placeholder dimensions.
+
+    Unauthenticated deliberately? No — the room's graph is behind the same token
+    as everything else. What is public is the IMAGE service (Cantaloupe), so a
+    viewer handed this manifest can paint it without a token while the manifest
+    itself, which describes somebody's study, is not handed out to strangers.
+    """
+    # The token may arrive in the header (a program) or in the query (a VIEWER).
+    # Same decision as the WebSocket, for the same reason: Mirador fetches this
+    # URL itself and cannot be asked to set a header, and refusing the query
+    # would mean no IIIF viewer could ever open one of our manifests. It is a
+    # URL a TLS connection protects, and the proxy does not log the query.
+    _authorise_manifest(request, token)
+    # …and a viewer fetching from its own origin needs CORS. Read-only, and only
+    # on this route: a manifest exists to be fetched by other people's software.
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    base = (image_base or IIIF_BASE).rstrip("/")
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="this deployment has no IIIF image service configured: set "
+                   "EM_IIIF_BASE (e.g. https://host/iiif/3) or pass "
+                   "?image_base=. A manifest pointing at nothing would look "
+                   "like a broken image rather than a missing service.")
+
+    room = await ROOMS.get(room_id)
+    graph, warnings = _room_graph(room)
+    internal = (IIIF_INTERNAL_BASE if base == IIIF_BASE else base) or base
+    sizes = _measure_images(graph, internal)
+    try:
+        manifest = em.iiif_manifest(graph, target_id, image_base=base,
+                                    manifest_id=str(request.url).split("?")[0],
+                                    sizes=sizes)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    if warnings:
+        manifest.setdefault("em:warnings", []).extend(warnings)
+    return manifest
+
+
+def _authorise_manifest(request: Request, token: Optional[str]) -> None:
+    """Bearer header, or `?token=` — the manifest is read by viewers."""
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer ") or not token:
+        authenticator.require_token(request)
+        return
+    if not authenticator.settings.enforcing:
+        return
+    try:
+        authenticator.verify(token.strip())
+    except HTTPException:
+        raise
+    except Exception as exc:                                   # noqa: BLE001
+        raise HTTPException(status_code=401,
+                            detail=f"token refused: {exc}") from None
+
+
+def _room_graph(room: Any):
+    """The room's ACTIVE graph, loaded through the library's own reader."""
+    document = room.document
+    graphs = document.get("graphs") or {}
+    graph_id = document.get("active_graph_id") or next(iter(graphs), None)
+    if not graph_id:
+        raise HTTPException(status_code=404,
+                            detail=f"room {room.room_id!r} holds no graph yet")
+    graph, warnings = em.load_emjson({"header": document.get("header", {}),
+                                      "graph": graphs[graph_id]})
+    return graph, list(warnings)
+
+
+def _measure_images(graph: Any, base: str) -> Dict[str, Any]:
+    """Ask the image server how big each image actually is.
+
+    One `info.json` per image, and a failure is not fatal: an image the service
+    cannot answer for gets no entry, and the library then says so in the
+    manifest rather than pretending. A missing size costs an aspect ratio; a
+    failed request must not cost the whole manifest.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from s3dgraphy.iiif import image_identifier, is_image
+
+    sizes: Dict[str, Any] = {}
+    for node in graph.nodes:
+        if getattr(node, "node_type", "") != "resource" or not is_image(node):
+            continue
+        identifier = image_identifier(node)
+        if not identifier:
+            continue
+        try:
+            with urllib.request.urlopen(f"{base}/{identifier}/info.json",
+                                        timeout=4) as answer:
+                info = _json.loads(answer.read())
+            sizes[node.node_id] = (int(info["width"]), int(info["height"]))
+        except (urllib.error.URLError, KeyError, ValueError, OSError):
+            continue
+    return sizes
+
+
 # ── validate ──────────────────────────────────────────────────────────────────
 
 @v1.post("/validate", tags=["graph"])

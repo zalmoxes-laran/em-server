@@ -440,3 +440,35 @@ def test_7d_the_health_route_says_where_the_truth_is(client):
     payload = client.get("/health").json()
     assert "snapshot_store" in payload
     assert payload["snapshot_store"].startswith(("memory", "directory", "minio"))
+
+
+def test_7e_an_edge_op_keeps_its_endpoints(client, fresh_rooms):
+    """The wire's `source` (who sent this) and an edge's `source` (where it
+    starts) are the same word for two different things.
+
+    Found by the IIIF smoke, not by reading: the relay stripped `source` from
+    every op — correct for the origin tag, fatal for an edge, which then landed
+    with `source: None`. It applied, it was broadcast, and the only trace was a
+    load warning about an edge whose ends do not exist, much later and somewhere
+    else.
+    """
+    _seed(fresh_rooms)
+    with client.websocket_connect("/v1/rooms/scavo/ws") as a:
+        _drain_join(a)
+        a.send_json({"v": 1, "type": "op", "source": "emstudio",
+                     "op": "add_node", "ts": T2,
+                     "node": {"id": "reg-1", "node_type": "annotation_region",
+                              "name": "regione"}})
+        assert a.receive_json()["applied"] is True
+        a.send_json({"v": 1, "type": "op", "source": "emstudio",
+                     "op": "add_edge", "ts": T2, "id": "e-1",
+                     "source": "reg-1", "target": "US1",
+                     "edge_type": "is_on_resource"})
+        assert a.receive_json()["applied"] is True
+
+    room = fresh_rooms.peek("scavo")
+    section = room.document["graphs"][next(iter(room.document["graphs"]))]
+    edge = next(e for e in section["edges"] if e["id"] == "e-1")
+    assert edge["source"] == "reg-1", "the edge starts where the client said"
+    assert edge["target"] == "US1"
+    assert edge["edge_type"] == "is_on_resource"

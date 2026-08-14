@@ -167,8 +167,19 @@ async def _handle(room, member, websocket: WebSocket, message: Dict[str, Any],
         # THE AUTHOR IS THE TOKEN'S, always. A client that names somebody else is
         # not lying to the relay, it is lying to everyone downstream — the stamp
         # is what the merge trusts (P4.1b), so it cannot be self-declared.
-        op = {k: v for k, v in message.items()
-              if k not in ("type", "v", "source", "author", "graph_id")}
+        #
+        # `source` is dropped for the same reason it exists — it is the WIRE's
+        # "who sent this", and the relay knows that better than the message does.
+        # But an EDGE op carries `source`/`target` as its two endpoints, and
+        # dropping those turns "reg-1 is_on_resource img-1" into an edge from
+        # nowhere: it applies, it is broadcast, and it only shows up much later as
+        # a load warning about an edge whose ends do not exist. So for edge ops
+        # the two keys are kept, and the wire's origin tag is simply not needed
+        # downstream.
+        strip = {"type", "v", "author", "graph_id"}
+        if str(message.get("op") or "") not in ("add_edge", "remove_edge"):
+            strip.add("source")
+        op = {k: v for k, v in message.items() if k not in strip}
         if author:
             op["author"] = author
         op.setdefault("ts", now_iso())
