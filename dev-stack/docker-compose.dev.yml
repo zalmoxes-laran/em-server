@@ -182,16 +182,16 @@ services:
       MINIO_SECURE: "false"
       # --- room documents ----------------------------------------------------
       EM_SNAPSHOT_DIR: "/srv/em-data/snapshots"
-      # --- images -------------------------------------------------------------
-      # Where clients should be sent for pixels. The manifest carries URLs that
-      # OTHER people's viewers will fetch, so it must name a host they can reach
-      # — `localhost` here, the public name behind the production proxy.
-      EM_IIIF_BASE: "http://localhost:${CANTALOUPE_PORT:-8182}/iiif/3"
-      # …and how em-server ITSELF reaches that image server, to read info.json
-      # and learn each image's real size. Not the same address: inside this
-      # network `localhost` is em-server. Without this every canvas would get a
-      # placeholder size and the manifest would say so — measured, not guessed.
-      EM_IIIF_INTERNAL_BASE: "http://cantaloupe:8182/iiif/3"
+      # --- images · the URL topology (docs/URL-TOPOLOGY.md) --------------------
+      # PUBLIC: what goes into a manifest. Other people's viewers fetch it, so it
+      # must name a host they can reach — `localhost` here, the proxy's name in
+      # production.
+      EM_IIIF_PUBLIC: "http://localhost:${CANTALOUPE_PORT:-8182}/iiif/3"
+      # INTERNAL: how em-server itself dials the image server, to read info.json
+      # and learn each image's real size. NOT the same address — inside this
+      # network `localhost` is em-server. Using the public form here measures
+      # nothing and every canvas silently gets a placeholder size.
+      EM_IIIF_INTERNAL: "http://cantaloupe:8182/iiif/3"
       # The dev stack runs the LIBRARY YOU ARE EDITING: the sibling s3Dgraphy
       # checkout is mounted and put first on the path. If it is not there the
       # mount is an empty directory and the image's pinned wheel is used instead

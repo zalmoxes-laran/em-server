@@ -1,10 +1,17 @@
 """The relay: `/v1/rooms/{id}/ws` — em-server as "just another host".
 
-It speaks **the wire that already exists** (ADR-002, the `v:1` messages EMStudio
-and EMtools use: `snapshot`, `op`, `host_info`, `select`, `command`). That is the
-whole trick of this step: when EMStudio points at an em-server in P4.3 it will
-not need a new protocol, because the relay is a host that happens to have several
-clients instead of one.
+It speaks **the wire that already exists** (ADR-002: `snapshot`, `op`,
+`host_info`, `select`, `command`). That is the whole trick of this step: when
+EMStudio points at an em-server it does not need a new protocol, because the
+relay is a host that happens to have several clients instead of one.
+
+**WIRE 2 · the body travels nested.** The envelope is `{v, type, source,
+graph_id?}` and everything type-specific is inside `payload` — see `wire.py` for
+the bug that taught us why. The consequence here is the important one: for an
+`op` the relay treats the payload as **opaque**. It stamps the author, it dates
+it, it hands it to the library and it forwards it verbatim. It never reaches
+into it for a field, so no word of the body can ever collide with a word of the
+wire again (an edge's `source` used to be eaten by the envelope's).
 
 What the relay does with an operation is **apply it through s3Dgraphy and pass it
 on**. It does not transform, order or reconcile anything: the CRDT of P4.1
@@ -30,14 +37,15 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from .auth import authenticator
 from .rooms import RoomRegistry, now_iso
 from .store import store_from_env
+from .wire import WIRE, WireError, envelope, read
 
 #: This process's rooms and the store behind them. Built at import so a
 #: misconfigured store fails when the process starts, not at the first join.
 SNAPSHOT_STORE = store_from_env()
 ROOMS = RoomRegistry(SNAPSHOT_STORE)
 
-#: The wire version. Same number as the bridge's, because it is the same wire.
-WIRE = 1
+#: The wire version lives in `wire.py` now — one definition for every speaker in
+#: this process, so a bump cannot be half-applied.
 
 #: What this host calls itself in `host_info` — a client shows it in its footer.
 HOST_TOOL = "em-server (relay)"
@@ -107,7 +115,7 @@ async def room_socket(websocket: WebSocket, room_id: str,
                        display=str(claims.get("name") or author or "anon"))
 
     # ── the join: who you are, what the room is, what you missed ─────────────
-    await _send(websocket, {"v": WIRE, "type": "host_info", "source": "em-server",
+    await _send(websocket, envelope("host_info", {
                             "tool": HOST_TOOL, "file": room_id,
                             "room": room_id, "connection_id": connection_id,
                             "author": author,
@@ -119,11 +127,12 @@ async def room_socket(websocket: WebSocket, room_id: str,
                             # Announcing it is the difference between a gap that
                             # is handled and one that is discovered.
                             "gc_watermark": room.compacted_upto,
-                            "accepts_commands": False})
-    await _send(websocket, {"v": WIRE, "type": "snapshot", "source": "em-server",
+                            "accepts_commands": False}, source="em-server"))
+    await _send(websocket, envelope("snapshot", {
                             "doc": room.document,
                             "gc_watermark": room.compacted_upto,
-                            "host": {"tool": HOST_TOOL, "file": room_id}})
+                            "host": {"tool": HOST_TOOL, "file": room_id}},
+                            source="em-server"))
     # presence closes the JOIN — three frames, always the same three, so a client
     # knows when it has arrived without counting
     await _broadcast_presence(room)
@@ -132,7 +141,7 @@ async def room_socket(websocket: WebSocket, room_id: str,
     for op in room.replay_since(since):
         # wrapped like any other op frame: what a client missed must arrive in
         # the SAME shape it would have had live, or a replay needs its own reader
-        await _send(websocket, {"v": WIRE, "type": "op", "source": "em-server", **op})
+        await _send(websocket, envelope("op", op, source="em-server"))
     member.watermark = room.last_op_at or now_iso()
 
     try:
@@ -144,13 +153,21 @@ async def room_socket(websocket: WebSocket, room_id: str,
                 continue
             try:
                 await _handle(room, member, websocket, message, author)
+            except WireError as exc:
+                # A speaker from another protocol version is TOLD, not
+                # half-understood. There are no external clients to migrate, but
+                # the day an old build connects it gets a sentence instead of an
+                # edge with no ends.
+                await _send(websocket, envelope(
+                    "error", {"detail": str(exc), "wire": WIRE},
+                    source="em-server"))
             except Exception as exc:      # noqa: BLE001
                 # A relay that dies on one bad message takes the room's other
                 # clients down with it. The connection survives and the sender is
                 # told — a silent drop would look exactly like a network problem.
-                await _send(websocket, {"v": WIRE, "type": "error",
-                                        "source": "em-server",
-                                        "detail": f"{type(exc).__name__}: {exc}"})
+                await _send(websocket, envelope(
+                    "error", {"detail": f"{type(exc).__name__}: {exc}"},
+                    source="em-server"))
     except WebSocketDisconnect:
         pass
     finally:
@@ -161,59 +178,57 @@ async def room_socket(websocket: WebSocket, room_id: str,
 
 async def _handle(room, member, websocket: WebSocket, message: Dict[str, Any],
                   author: Optional[str]) -> None:
-    kind = str(message.get("type") or "")
+    kind, payload = read(message)          # …and a wrong version raises WireError
 
     if kind == "op":
         # THE AUTHOR IS THE TOKEN'S, always. A client that names somebody else is
         # not lying to the relay, it is lying to everyone downstream — the stamp
         # is what the merge trusts (P4.1b), so it cannot be self-declared.
         #
-        # `source` is dropped for the same reason it exists — it is the WIRE's
-        # "who sent this", and the relay knows that better than the message does.
-        # But an EDGE op carries `source`/`target` as its two endpoints, and
-        # dropping those turns "reg-1 is_on_resource img-1" into an edge from
-        # nowhere: it applies, it is broadcast, and it only shows up much later as
-        # a load warning about an edge whose ends do not exist. So for edge ops
-        # the two keys are kept, and the wire's origin tag is simply not needed
-        # downstream.
-        strip = {"type", "v", "author", "graph_id"}
-        if str(message.get("op") or "") not in ("add_edge", "remove_edge"):
-            strip.add("source")
-        op = {k: v for k, v in message.items() if k not in strip}
+        # The payload is otherwise **opaque**: copied, stamped, dated, forwarded.
+        # That is the whole cure — there is no longer any envelope word to strip
+        # out of it, so an edge's `source`/`target` cannot be mistaken for the
+        # wire's "who sent this" (WIRE 2; the per-verb exception this replaces
+        # was a symptom fix).
+        op = dict(payload)
+        # The client's own `author`, if it wrote one, is DROPPED before anything
+        # else — not merely overwritten. In dev mode there is no token identity,
+        # and "overwrite when we have one" quietly let a self-declared author
+        # through exactly there. An author nobody verified is not an author.
+        op.pop("author", None)
         if author:
             op["author"] = author
         op.setdefault("ts", now_iso())
+        graph_id = message.get("graph_id")
         async with room.lock:
-            result = room.apply(op, message.get("graph_id"))
+            result = room.apply(op, graph_id)
             if not result.get("applied"):
                 # stale / idempotent / refused: it is NOT news, and re-broadcasting
                 # it would hand the other clients a regression to re-apply
-                await _send(websocket, {"v": WIRE, "type": "op_result",
-                                        "source": "em-server",
-                                        "applied": False,
-                                        "reason": result.get("reason", ""),
-                                        "op": op})
+                await _send(websocket, envelope(
+                    "op_result",
+                    {"applied": False, "reason": result.get("reason", ""), "op": op},
+                    source="em-server"))
                 return
             room.record(op)
-            outbound = {"v": WIRE, "type": "op", "source": "em-server", **op}
-            if message.get("graph_id"):
-                outbound["graph_id"] = message["graph_id"]
+            outbound = envelope("op", op, source="em-server", graph_id=graph_id)
         await _fanout(room, outbound, skip=member.connection_id)
-        await _send(websocket, {"v": WIRE, "type": "op_result", "source": "em-server",
-                                "applied": True, "reason": result.get("reason", ""),
-                                "op": op})
+        await _send(websocket, envelope(
+            "op_result",
+            {"applied": True, "reason": result.get("reason", ""), "op": op},
+            source="em-server"))
         return
 
     if kind == "select":
         # awareness, soft and never a lock (design P4 §6)
-        ids = message.get("node_ids") or ([message["node_id"]]
-                                          if message.get("node_id") else [])
+        ids = payload.get("node_ids") or ([payload["node_id"]]
+                                          if payload.get("node_id") else [])
         member.selection = [str(i) for i in ids]
-        await _fanout(room, {"v": WIRE, "type": "select", "source": "em-server",
-                             "connection_id": member.connection_id,
-                             "author": author,
-                             "node_id": message.get("node_id"),
-                             "node_ids": member.selection},
+        await _fanout(room, envelope("select", {
+            "connection_id": member.connection_id,
+            "author": author,
+            "node_id": payload.get("node_id"),
+            "node_ids": member.selection}, source="em-server"),
                       skip=member.connection_id)
         # NO presence broadcast here: the `select` frame IS the awareness
         # message, and sending the roster after every click would be noise the
@@ -221,25 +236,25 @@ async def _handle(room, member, websocket: WebSocket, message: Dict[str, Any],
         return
 
     if kind == "request_snapshot":
-        await _send(websocket, {"v": WIRE, "type": "snapshot", "source": "em-server",
-                                "doc": room.document,
-                                "gc_watermark": room.compacted_upto,
-                                "host": {"tool": HOST_TOOL, "file": room.room_id}})
+        await _send(websocket, envelope("snapshot", {
+            "doc": room.document,
+            "gc_watermark": room.compacted_upto,
+            "host": {"tool": HOST_TOOL, "file": room.room_id}},
+            source="em-server"))
         return
 
     if kind == "request_save":
         # the client asks the host to persist: for a relay that IS the snapshot
         async with room.lock:
             info = room.snapshot(SNAPSHOT_STORE)
-        await _fanout(room, {"v": WIRE, "type": "snapshot_written",
-                             "source": "em-server", **info})
+        await _fanout(room, envelope("snapshot_written", info, source="em-server"))
         return
 
     if kind == "ack":
         # "I have applied everything up to here" — the watermark that makes
         # compaction safe. A client that never acks simply holds the GC back,
         # which is the failure direction we want.
-        member.watermark = str(message.get("ts") or member.watermark or now_iso())
+        member.watermark = str(payload.get("ts") or member.watermark or now_iso())
         return
 
 
@@ -250,21 +265,24 @@ async def _send(websocket: WebSocket, payload: Dict[str, Any]) -> None:
         pass
 
 
-async def _fanout(room, payload: Dict[str, Any], *, skip: Optional[str] = None) -> None:
+async def _fanout(room, message: Dict[str, Any], *, skip: Optional[str] = None) -> None:
     """Send to everybody but the origin — the echo suppression the bridge already
     does, for the same reason: a client must not have to recognise its own work
     coming back."""
+    body = message.get("payload") or {}
     for connection_id, socket in list(room.sockets.items()):
         if connection_id == skip:
             continue
-        await _send(socket, payload)
+        await _send(socket, message)
         member = room.members.get(connection_id)
-        if member is not None and payload.get("type") == "op":
-            member.watermark = str(payload.get("ts") or member.watermark or "")
+        if member is not None and message.get("type") == "op":
+            # the timestamp is a field OF THE OP, and the op lives in the payload
+            member.watermark = str(body.get("ts") or member.watermark or "")
 
 
 async def _broadcast_presence(room) -> None:
-    payload = {"v": WIRE, "type": "presence", "source": "em-server",
-               "room": room.room_id, "members": room.presence()}
+    message = envelope("presence", {"room": room.room_id,
+                                    "members": room.presence()},
+                       source="em-server")
     for socket in list(room.sockets.values()):
-        await _send(socket, payload)
+        await _send(socket, message)

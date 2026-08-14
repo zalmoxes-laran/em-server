@@ -236,20 +236,38 @@ def get_asset(room_id: str, ref: str) -> Response:
 
 # ── IIIF: the manifest of a room's image or document ──────────────────────────
 
-#: The Image API base CLIENTS should be sent to. The manifest carries URLs other
-#: people's viewers will fetch, so it must name a host they can reach: in the dev
-#: stack that is Cantaloupe on localhost, behind the production proxy it is
-#: `https://<host>/iiif/3`.
-IIIF_BASE = (os.environ.get("EM_IIIF_BASE") or "").rstrip("/")
+# ── URL topology · one house for internal↔public ─────────────────────────────
+#
+# Every service→service URL in this deployment has TWO forms, and confusing them
+# fails opaquely — a 403, an empty body, a mixed-content block. The pairs are
+# listed once in `docs/URL-TOPOLOGY.md`; the rule is one line:
+#
+#     em-server SPEAKS on the internal form and WRITES the public form into the
+#     documents it serves.
+#
+# `EM_IIIF_PUBLIC` is what goes into a manifest (other people's viewers fetch
+# it, so it must name a host they can reach). `EM_IIIF_INTERNAL` is how this
+# process reaches the same image server to read `info.json` — inside a compose
+# network `localhost` is em-server itself, so using the public form here
+# measures nothing and every canvas silently gets a placeholder size.
+#
+# The older `EM_IIIF_BASE` / `EM_IIIF_INTERNAL_BASE` spellings are still read, in
+# that order: one setting with two names and a precedence, never two settings
+# that will one day disagree.
+def _env_url(*names: str) -> str:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value.rstrip("/")
+    return ""
 
-#: …and how THIS PROCESS reaches the same image server, which is not the same
-#: address. Inside a compose network `localhost` is em-server itself, so a server
-#: that fetched `info.json` from the public base would silently measure nothing
-#: and every canvas would get a placeholder size. Same split as `OIDC_ISSUER`
-#: (what the token says) versus `OIDC_JWKS_URI` (where we go to check it), and it
-#: goes wrong the same way: both sides look right and the result is quietly poor.
-IIIF_INTERNAL_BASE = (os.environ.get("EM_IIIF_INTERNAL_BASE")
-                      or IIIF_BASE).rstrip("/")
+
+IIIF_PUBLIC = _env_url("EM_IIIF_PUBLIC", "EM_IIIF_BASE")
+IIIF_INTERNAL = _env_url("EM_IIIF_INTERNAL", "EM_IIIF_INTERNAL_BASE") or IIIF_PUBLIC
+
+#: Kept as the old name so nothing else in this module has to change spelling.
+IIIF_BASE = IIIF_PUBLIC
+IIIF_INTERNAL_BASE = IIIF_INTERNAL
 
 
 # On the router WITHOUT the blanket auth dependency, and doing the check itself:
@@ -272,32 +290,42 @@ async def iiif_manifest(room_id: str, target_id: str, request: Request,
       that made HTTP calls would be untestable and would break offline; a server
       that refused to would emit canvases with placeholder dimensions.
 
-    Unauthenticated deliberately? No — the room's graph is behind the same token
-    as everything else. What is public is the IMAGE service (Cantaloupe), so a
-    viewer handed this manifest can paint it without a token while the manifest
-    itself, which describes somebody's study, is not handed out to strangers.
+    **Public or restricted, per STUDY** (the tiers of D2.2 §3.4). A room whose
+    document says `header.visibility: "public"` is the *dissemination* tier —
+    validated work, meant to be read by anybody — so its manifest is served
+    **without a token**: that is what publishing means. Anything else is
+    in-progress and stays behind the token, which is also the DEFAULT, because a
+    study served too openly cannot be un-served.
+
+    What the gate actually protects is worth stating, because it is not obvious:
+    the image service (Cantaloupe) has no auth of its own, but an image is
+    addressed by its **sha256**, and the only place a digest comes from is the
+    graph. **The manifest is the capability.** Refuse it and a restricted study's
+    assets are unguessable; serve it and you have published them — which is why
+    the decision lives with the study rather than in a config file.
+
+    The token may arrive in the header (a program) or in the query (a VIEWER):
+    Mirador fetches this URL itself and cannot be asked to set a header, and
+    refusing the query would mean no IIIF viewer could open one of our manifests.
     """
-    # The token may arrive in the header (a program) or in the query (a VIEWER).
-    # Same decision as the WebSocket, for the same reason: Mirador fetches this
-    # URL itself and cannot be asked to set a header, and refusing the query
-    # would mean no IIIF viewer could ever open one of our manifests. It is a
-    # URL a TLS connection protects, and the proxy does not log the query.
-    _authorise_manifest(request, token)
     # …and a viewer fetching from its own origin needs CORS. Read-only, and only
     # on this route: a manifest exists to be fetched by other people's software.
     response.headers["Access-Control-Allow-Origin"] = "*"
-    base = (image_base or IIIF_BASE).rstrip("/")
+    base = (image_base or IIIF_PUBLIC).rstrip("/")
     if not base:
         raise HTTPException(
             status_code=503,
             detail="this deployment has no IIIF image service configured: set "
-                   "EM_IIIF_BASE (e.g. https://host/iiif/3) or pass "
+                   "EM_IIIF_PUBLIC (e.g. https://host/iiif/3) or pass "
                    "?image_base=. A manifest pointing at nothing would look "
                    "like a broken image rather than a missing service.")
 
     room = await ROOMS.get(room_id)
+    if not room.is_public:
+        _authorise_manifest(request, token)
     graph, warnings = _room_graph(room)
-    internal = (IIIF_INTERNAL_BASE if base == IIIF_BASE else base) or base
+    # SPEAK on the internal form, WRITE the public one into the document
+    internal = (IIIF_INTERNAL if base == IIIF_PUBLIC else base) or base
     sizes = _measure_images(graph, internal)
     try:
         manifest = em.iiif_manifest(graph, target_id, image_base=base,

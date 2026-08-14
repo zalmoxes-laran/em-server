@@ -88,6 +88,31 @@ class Room:
         #: point the room no longer holds what a replay would argue with.
         self.compacted_upto: Optional[str] = None
 
+    # ── who may read this study ──────────────────────────────────────────────
+
+    @property
+    def visibility(self) -> str:
+        """`public` or `restricted` — read from the STUDY, not from a config.
+
+        It belongs in the document's header because it is a fact about the work
+        (D2.2 §3.4: dissemination is a *validated* tier, in-progress is not), and
+        a study that travels — a file somebody sends, a snapshot restored
+        elsewhere — must carry its own answer rather than inherit whatever the
+        new server happens to think.
+
+        **Restricted is the default, and unknown reads as restricted.** The
+        failure directions are not symmetric: a public study served behind a
+        token annoys somebody, an in-progress study served without one publishes
+        an interpretation nobody has finished making.
+        """
+        header = self.document.get("header")
+        value = str((header or {}).get("visibility") or "").strip().lower()
+        return "public" if value == "public" else "restricted"
+
+    @property
+    def is_public(self) -> bool:
+        return self.visibility == "public"
+
     # ── membership ───────────────────────────────────────────────────────────
 
     def join(self, connection_id: str, socket: Any, author: Optional[str],

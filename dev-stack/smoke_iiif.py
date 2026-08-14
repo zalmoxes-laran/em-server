@@ -165,7 +165,7 @@ def jpeg_size(data: bytes) -> tuple[int, int] | None:
 
 
 WIDTH, HEIGHT = 1024, 768
-ROOM = "iiif-smoke-5"
+ROOM = "wire2-smoke"
 REGIONS = {                       # normalised [0,1] — the truth in the graph
     "reg-muro": [0.10, 0.10, 0.30, 0.20],
     "reg-soglia": [0.55, 0.60, 0.25, 0.25],
@@ -270,9 +270,11 @@ def main() -> int:
         for _ in range(3):                         # host_info, snapshot, presence
             room.recv()
         applied = 0
-        # `node_type`, not `type`: it is what the em.json schema says, and the
-        # loader SKIPS a node it cannot type — with a warning nobody sees if the
-        # only thing checked is that the op was applied
+        # Two shapes that are easy to get wrong and silent when you do:
+        #  · `node_type`, not `type` — the em.json loader SKIPS a node it cannot
+        #    type, with a warning nobody sees if the only check is "op applied";
+        #  · WIRE 2 — the op is the PAYLOAD of the message, not spread across it
+        #    (which is how an edge used to lose its endpoints).
         ops = [{"op": "add_node", "node": {
             "id": "img-1", "node_type": "resource", "name": "Foto di scavo",
             "data": {"url": f"{server}/v1/rooms/{ROOM}/asset/{digest}",
@@ -291,17 +293,19 @@ def main() -> int:
                         "source": node_id, "target": "img-1",
                         "edge_type": "is_on_resource"})
         for index, op in enumerate(ops):
-            room.send({"v": 1, "type": "op", "ts": f"2026-08-14T14:00:{index:02d}Z",
-                       **op})
+            room.send({"v": 2, "type": "op", "source": "smoke",
+                       "payload": {**op,
+                                   "ts": f"2026-08-14T14:00:{index:02d}Z"}})
         accepted = 0
         for _ in ops:
             answer = room.recv()
             if not answer or answer.get("type") != "op_result":
                 continue
-            if answer.get("applied"):
+            body = answer.get("payload") or {}
+            if body.get("applied"):
                 applied += 1
                 accepted += 1
-            elif answer.get("reason") == "idempotent":
+            elif body.get("reason") == "idempotent":
                 # a second run of this smoke re-sends the same nodes: the CRDT
                 # says "already here", which is the room HOLDING them, not a
                 # failure. Counting it as one would make the check pass only on

@@ -42,6 +42,7 @@ from app import ws as ws_module                      # noqa: E402
 from app.main import app                             # noqa: E402
 from app.rooms import RoomRegistry                   # noqa: E402
 from app.store import DirectorySnapshotStore, InMemorySnapshotStore  # noqa: E402
+from app.wire import WIRE                             # noqa: E402
 
 from s3dgraphy import api as em                      # noqa: E402
 
@@ -76,12 +77,16 @@ def _drain_join(socket):
     assert snapshot["type"] == "snapshot"
     presence = socket.receive_json()
     assert presence["type"] == "presence"
-    return snapshot["doc"]
+    # WIRE 2 · every message is `{v, type, source, payload}` — the body is
+    # nested, so no field of it can collide with a word of the envelope
+    return snapshot["payload"]["doc"]
 
 
 def _op(field, value, ts, node_id="US1", **extra):
-    return {"v": 1, "type": "op", "op": "update_field", "node_id": node_id,
-            "field": field, "value": value, "ts": ts, **extra}
+    """One `op` message, WIRE 2: envelope outside, the operation inside."""
+    return {"v": WIRE, "type": "op", "source": "test",
+            "payload": {"op": "update_field", "node_id": node_id,
+                        "field": field, "value": value, "ts": ts, **extra}}
 
 
 def _seed(registry, room_id="scavo"):
@@ -118,9 +123,9 @@ def test_1_an_op_reaches_the_others_and_does_not_echo(client, fresh_rooms):
         a.send_json(_op("description", "muro in opus", T2))
         # A gets its own ACK — and NOT the operation back
         ack = a.receive_json()
-        assert ack["type"] == "op_result" and ack["applied"] is True
+        assert ack["type"] == "op_result" and ack["payload"]["applied"] is True
         got = b.receive_json()
-        assert got["type"] == "op" and got["value"] == "muro in opus"
+        assert got["type"] == "op" and got["payload"]["value"] == "muro in opus"
         assert got["source"] == "em-server"
 
 
@@ -135,16 +140,16 @@ def test_1b_a_stale_op_is_not_propagated_as_news(client, fresh_rooms):
         a.receive_json()
 
         a.send_json(_op("description", "recente", T3))
-        assert a.receive_json()["applied"] is True
-        assert b.receive_json()["value"] == "recente"      # B receives the fresh one
+        assert a.receive_json()["payload"]["applied"] is True
+        assert b.receive_json()["payload"]["value"] == "recente"      # B receives the fresh one
 
         a.send_json(_op("description", "vecchia", T1))
         result = a.receive_json()
-        assert result["applied"] is False and result["reason"] == "stale"
+        assert result["payload"]["applied"] is False and result["payload"]["reason"] == "stale"
         # …and B was told NOTHING about it: the next thing it hears is a NEW op
         a.send_json(_op("data.nota", "seguito", T3))
-        assert a.receive_json()["applied"] is True
-        assert b.receive_json()["field"] == "data.nota"
+        assert a.receive_json()["payload"]["applied"] is True
+        assert b.receive_json()["payload"]["field"] == "data.nota"
 
 
 # ── 2 · convergenza ─────────────────────────────────────────────────────────
@@ -164,10 +169,10 @@ def test_2_concurrent_ops_converge_and_agree_with_the_offline_merge(client, fres
         a.receive_json()
 
         a.send_json(_op("description", "muro in opus", T2))
-        assert a.receive_json()["applied"] is True
+        assert a.receive_json()["payload"]["applied"] is True
         assert b.receive_json()["type"] == "op"
         b.send_json(_op("data.dating", "II sec. d.C.", T3))
-        assert b.receive_json()["applied"] is True
+        assert b.receive_json()["payload"]["applied"] is True
         assert a.receive_json()["type"] == "op"
 
         room = fresh_rooms.peek("scavo")
@@ -195,7 +200,7 @@ def test_3_a_late_client_gets_the_snapshot_and_what_it_missed(client, fresh_room
     with client.websocket_connect("/v1/rooms/scavo/ws") as a:
         _drain_join(a)
         a.send_json(_op("description", "muro in opus", T2))
-        assert a.receive_json()["applied"] is True
+        assert a.receive_json()["payload"]["applied"] is True
 
         with client.websocket_connect("/v1/rooms/scavo/ws") as late:
             doc = _drain_join(late)
@@ -217,7 +222,7 @@ def test_3b_a_client_that_says_where_it_stopped_gets_the_replay(client, fresh_ro
         with client.websocket_connect(f"/v1/rooms/scavo/ws?since={T2}") as late:
             _drain_join(late)
             replayed = late.receive_json()
-            assert replayed["type"] == "op" and replayed["ts"] == T3, \
+            assert replayed["type"] == "op" and replayed["payload"]["ts"] == T3, \
                 "only what happened after the point the client names"
 
 
@@ -247,7 +252,7 @@ def test_4_a_snapshot_writes_compacts_and_truncates(client, fresh_rooms):
         _drain_join(a)
         # an op moves the watermark forward: the client has now been brought past T2
         a.send_json(_op("description", "aggiornata", T2))
-        assert a.receive_json()["applied"] is True
+        assert a.receive_json()["payload"]["applied"] is True
 
         room = fresh_rooms.peek(room_id)
         before_stats = em.crdt_stats(room.document)
@@ -256,14 +261,14 @@ def test_4_a_snapshot_writes_compacts_and_truncates(client, fresh_rooms):
                          em.live_nodes(room.document["graphs"][room_id])]
         assert before_stats["node_tombstones"] == 1
 
-        a.send_json({"v": 1, "type": "request_save"})
+        a.send_json({"v": WIRE, "type": "request_save", "payload": {}})
         written = a.receive_json()
         assert written["type"] == "snapshot_written"
 
         after_stats = em.crdt_stats(room.document)
         after_live = em.live_nodes(room.document["graphs"][room_id])
         assert after_stats["node_tombstones"] == 0, "the settled deletion is gone"
-        assert written["compaction"]["nodes_dropped"] == 1
+        assert written["payload"]["compaction"]["nodes_dropped"] == 1
         # …and NOTHING observable changed
         assert len(after_live) == before_live
         assert [n.get("description") for n in after_live] == before_values
@@ -284,7 +289,7 @@ def test_4b_a_cold_room_is_rebuilt_from_the_store(client, fresh_rooms):
         _drain_join(a)
         a.send_json(_op("description", "muro", T2))
         a.receive_json()
-        a.send_json({"v": 1, "type": "request_save"})
+        a.send_json({"v": WIRE, "type": "request_save", "payload": {}})
         a.receive_json()
 
     fresh_rooms.forget("scavo")               # the process "restarts"
@@ -336,7 +341,7 @@ def test_5b_the_author_is_the_token_not_what_the_client_says(monkeypatch, client
         _drain_join(a)
         # the client claims to be Bruno…
         a.send_json(_op("description", "scritta da chi?", T2, author=BRUNO))
-        assert a.receive_json()["applied"] is True
+        assert a.receive_json()["payload"]["applied"] is True
         node = fresh_rooms.peek("scavo").document["graphs"]["scavo"]["nodes"][0]
         # …and the graph records the TOKEN's identity
         assert node["data"]["modified_by"] == ANNA
@@ -353,10 +358,10 @@ def test_6_presence_appears_and_disappears(client, fresh_rooms):
             _drain_join(b)
             arrival = a.receive_json()
             assert arrival["type"] == "presence"
-            assert len(arrival["members"]) == 2, "A is told that B is here"
+            assert len(arrival["payload"]["members"]) == 2, "A is told that B is here"
         departure = a.receive_json()
         assert departure["type"] == "presence"
-        assert len(departure["members"]) == 1, "…and that B has gone"
+        assert len(departure["payload"]["members"]) == 1, "…and that B has gone"
 
 
 def test_6b_a_selection_is_awareness_and_not_a_lock(client, fresh_rooms):
@@ -367,13 +372,13 @@ def test_6b_a_selection_is_awareness_and_not_a_lock(client, fresh_rooms):
         _drain_join(b)
         a.receive_json()
 
-        b.send_json({"v": 1, "type": "select", "node_id": "US1"})
+        b.send_json({"v": WIRE, "type": "select", "payload": {"node_id": "US1"}})
         seen = a.receive_json()
-        assert seen["type"] == "select" and seen["node_ids"] == ["US1"]
+        assert seen["type"] == "select" and seen["payload"]["node_ids"] == ["US1"]
 
         # …and A can still write that very node: awareness, never a lock
         a.send_json(_op("description", "scrivo lo stesso", T2))
-        assert a.receive_json()["applied"] is True
+        assert a.receive_json()["payload"]["applied"] is True
         assert any(m["selection"] == ["US1"] for m in
                    fresh_rooms.peek("scavo").presence())
 
@@ -384,7 +389,7 @@ def test_6c_presence_is_not_written_anywhere(client, fresh_rooms):
     _seed(fresh_rooms)
     with client.websocket_connect("/v1/rooms/scavo/ws") as a:
         _drain_join(a)
-        a.send_json({"v": 1, "type": "request_save"})
+        a.send_json({"v": WIRE, "type": "request_save", "payload": {}})
         a.receive_json()
     stored = json.dumps(fresh_rooms.store.get("scavo"))
     for word in ("presence", "connection_id", "joined_at"):
@@ -455,16 +460,22 @@ def test_7e_an_edge_op_keeps_its_endpoints(client, fresh_rooms):
     _seed(fresh_rooms)
     with client.websocket_connect("/v1/rooms/scavo/ws") as a:
         _drain_join(a)
-        a.send_json({"v": 1, "type": "op", "source": "emstudio",
-                     "op": "add_node", "ts": T2,
-                     "node": {"id": "reg-1", "node_type": "annotation_region",
-                              "name": "regione"}})
-        assert a.receive_json()["applied"] is True
-        a.send_json({"v": 1, "type": "op", "source": "emstudio",
-                     "op": "add_edge", "ts": T2, "id": "e-1",
-                     "source": "reg-1", "target": "US1",
-                     "edge_type": "is_on_resource"})
-        assert a.receive_json()["applied"] is True
+        a.send_json({"v": WIRE, "type": "op", "source": "emstudio",
+                     "payload": {"op": "add_node", "ts": T2,
+                                 "node": {"id": "reg-1",
+                                          "node_type": "annotation_region",
+                                          "name": "regione"}}})
+        assert a.receive_json()["payload"]["applied"] is True
+        # The edge carries `source`/`target` as its ENDPOINTS. In WIRE 1 they sat
+        # at the top level beside the envelope's own `source`, and the relay ate
+        # them. Nested, the collision cannot happen — and the envelope below
+        # still says `emstudio`, so both words are present and neither is
+        # ambiguous.
+        a.send_json({"v": WIRE, "type": "op", "source": "emstudio",
+                     "payload": {"op": "add_edge", "ts": T2, "id": "e-1",
+                                 "source": "reg-1", "target": "US1",
+                                 "edge_type": "is_on_resource"}})
+        assert a.receive_json()["payload"]["applied"] is True
 
     room = fresh_rooms.peek("scavo")
     section = room.document["graphs"][next(iter(room.document["graphs"]))]
