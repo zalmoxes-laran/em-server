@@ -232,10 +232,19 @@ def test_the_openapi_schema_is_served():
     paths = set(schema["paths"])
     assert {"/v1/health", "/v1/validate", "/v1/export-ttl", "/v1/reproject",
             "/v1/resolve-authority"} <= paths
-    # and nothing that writes: P0 is read-only
-    for path, ops in schema["paths"].items():
-        for verb in ("put", "patch", "delete"):
-            assert verb not in ops, f"{verb.upper()} {path} — P0 is read-only"
+    # P0 was read-only. A ROOM is not: it holds a study's graph and the bytes it
+    # points at, so publishing an asset is a PUT — the one write this service
+    # has, and it is content-addressed (the same bytes are the same object), so
+    # it creates rather than modifies.
+    #
+    # What stays forbidden is what would make the service a mutable store:
+    # PATCH (change something in place) and DELETE (remove it). Nothing here
+    # takes anything away — the graph's own deletions are tombstones inside a
+    # document, not HTTP verbs.
+    writes = {(verb.upper(), path) for path, ops in schema["paths"].items()
+              for verb in ops if verb in ("put", "patch", "delete")}
+    assert writes == {("PUT", "/v1/rooms/{room_id}/asset")}, \
+        f"unexpected write endpoints: {sorted(writes)}"
 
 
 # ── versioning: the promise the path makes (P0.1) ─────────────────────────────

@@ -42,7 +42,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
+from fastapi import Request
+
+from .assets import ASSET_STORE, asset_ref_valid
+from .assets import describe as asset_describe
 from .auth import AuthDependency, authenticator
+from .store import describe as snapshot_describe
+from .ws import ROOMS, SNAPSHOT_STORE, ws_router
 
 try:  # the whole point of the service; a clear failure beats a mysterious one
     from s3dgraphy import api as em
@@ -122,6 +128,17 @@ class Health(BaseModel):
     #: nobody reads: this way "is this deployment actually protected?" is one
     #: unauthenticated GET away, for the operator and for the client alike.
     auth: str = "dev-no-auth"
+    #: P4.2 · WHERE THE DURABLE TRUTH IS. The relay holds a working copy in RAM;
+    #: this says what is behind it — and an operator who reads "memory" knows
+    #: their snapshots die with the process, instead of finding out.
+    snapshot_store: str = "memory"
+    #: how many rooms this instance currently owns (sticky routing)
+    rooms: int = 0
+    #: where a room's ASSET bytes live. Same question as `snapshot_store`, asked
+    #: of the other half of what a room provides: the graph AND the models it
+    #: points at. An operator who reads "memory" knows their uploads die with the
+    #: process, instead of finding out later.
+    asset_store: str = "memory"
 
 
 @v1_public.get("/health", response_model=Health, tags=["meta"])
@@ -152,7 +169,69 @@ def health() -> Health:
             "resolve_authority": bool(em.authority_facets()),
         },
         auth=authenticator.settings.describe(),
+        snapshot_store=snapshot_describe(SNAPSHOT_STORE),
+        asset_store=asset_describe(ASSET_STORE),
+        rooms=len(ROOMS.rooms()),
     )
+
+
+# ── assets (the other half of what a room provides) ──────────────────────────
+#
+# A room gives a graph and the BYTES its assertions point at. Everything here is
+# transport: the store decides what a reference is (the digest of the content),
+# and this decides who may ask. No logic, per rule 1 — there is nothing to
+# compute about a blob beyond hashing it, and the hashing is the store's.
+
+
+class AssetInfo(BaseModel):
+    ref: str
+    sha256: str
+    media_type: str
+    size: int
+    #: False when these exact bytes were already there. Content-addressing makes
+    #: dedup automatic; SAYING it lets a client show "already published".
+    created: bool = True
+    #: who uploaded — the TOKEN's identity, never a field the client filled in
+    author: Optional[str] = None
+
+
+@v1.put("/rooms/{room_id}/asset", response_model=AssetInfo, tags=["assets"])
+async def put_asset(room_id: str, request: Request,
+                    media_type: str = Query(default="application/octet-stream",
+                                            description="the MIME type of the bytes")) -> AssetInfo:
+    """Publish bytes into a room's store; the reference is their digest.
+
+    The body is the raw bytes (not multipart): an asset is one object, and a
+    form wrapper would only add a boundary to parse. Re-uploading the same bytes
+    is not an error and not a duplicate — it is the same object, and the answer
+    says `created: false`.
+    """
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty body: nothing to store")
+    info = ASSET_STORE.put(data, media_type)
+    principal = authenticator.require_token(request)
+    author = None if principal.get("em_dev_mode") else (
+        principal.get("orcid") or principal.get("preferred_username")
+        or principal.get("sub"))
+    return AssetInfo(**info, author=author)
+
+
+@v1.get("/rooms/{room_id}/asset/{ref:path}", tags=["assets"])
+def get_asset(room_id: str, ref: str) -> Response:
+    """Fetch an asset by reference. The caller can verify what it got: the
+    reference IS the digest."""
+    if not asset_ref_valid(ref):
+        raise HTTPException(status_code=400,
+                            detail=f"not an asset reference: {ref!r} "
+                                   f"(expected 'sha256:<hex>')")
+    data = ASSET_STORE.get(ref)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"no asset {ref}")
+    meta = ASSET_STORE.head(ref) or {}
+    return Response(content=data,
+                    media_type=str(meta.get("media_type") or "application/octet-stream"),
+                    headers={"ETag": f'"{ref}"'})
 
 
 # ── validate ──────────────────────────────────────────────────────────────────
@@ -301,6 +380,11 @@ def resolve_authority_post(req: AuthorityRequest) -> Dict[str, Any]:
 
 app.include_router(v1_public)
 app.include_router(v1)
+#: P4.2 · the relay. A router of its own because it is a different KIND of thing:
+#: everything above is stateless request/response, and this holds connections. It
+#: authenticates in the handshake rather than through the router dependency —
+#: a WebSocket has no place to put a 401 body, so the refusal is a close code.
+app.include_router(ws_router)
 
 
 @app.get("/health", response_model=Health, tags=["meta"],

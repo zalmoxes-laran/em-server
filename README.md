@@ -30,6 +30,33 @@ replicas behind a load balancer safe, and it is a property to defend — the fir
 endpoint that keeps a file on disk breaks it. (`.gitignore` says the same thing:
 if it ever needs an entry for uploads, fix the code, not the ignore list.)
 
+### …and the exception, named (P4.2)
+
+A **real-time relay holds connections**: it cannot be stateless, and pretending
+otherwise would be worse than saying so. `/v1/rooms/{id}/ws` is where a new *kind*
+of state enters this service, and it comes with three fences that keep rule 2
+meaningful rather than abandoned:
+
+* **The durable truth is outside the process.** A room's snapshot goes to an
+  object store (`app/store.py`; MinIO in the deployment). What lives in RAM is a
+  *working copy*, rebuilt from the snapshot when a cold room is opened — the
+  process may die, the study does not live inside it. `GET /health` reports
+  `snapshot_store`, so "do my snapshots survive a restart?" is one unauthenticated
+  GET away.
+* **Convergence stays in the library.** The relay applies each operation through
+  `s3dgraphy.api` and re-broadcasts it. It does not transform, order or reconcile:
+  the CRDT converges whatever the order (P4.1), which is exactly why a *relay* is
+  enough and an operational-transform server is not. There is a test that fails if
+  `app/ws.py` or `app/rooms.py` ever reaches past `api` — the same guard rule 1
+  already had, extended to the stateful part.
+* **Presence is ephemeral.** Who is connected, and what they have selected, lives
+  in RAM and is lost on restart. That is correct: presence is about *now*, and a
+  test asserts that none of it reaches the store.
+
+Rooms are **sticky**: one instance owns a room. Several replicas would need the
+op-log outside the process (a Redis stream, or the store) — the seam is written
+down in `app/rooms.py` and deliberately not implemented.
+
 ## Endpoints (P0)
 
 | endpoint | what it does | needs |
