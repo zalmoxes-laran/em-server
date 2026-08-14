@@ -1,0 +1,50 @@
+# The dev stack's HTTPS front door — deliberately the SAME SHAPE as production.
+#
+# `heriverse-ansible/role/templates/Caddyfile.j2` terminates TLS on one host and
+# reverse-proxies by path to service names on the internal network. This file
+# does the same thing on `em.localhost`, so what is exercised here is the
+# arrangement that will run on the institutional host: one origin for the app,
+# the room, the images and the assets — which is what removes mixed-content and
+# makes a token in a query defensible.
+#
+# The certificate is issued by Caddy's INTERNAL CA (`tls internal`). Trusting it
+# is a step for a human with a password — see README-DEV. Until then `curl
+# --cacert` works and browsers do not, and that boundary is the honest state of
+# a local https: the real answer is a public certificate on a real host.
+
+{
+	# a local CA, not ACME: there is nothing public to validate here
+	local_certs
+	auto_https disable_redirects
+}
+
+https://{$EM_DEV_DOMAIN:em.localhost} {
+	tls internal
+
+	# StratiGraph · the room (graph + assets + the WebSocket the editors join).
+	# `handle_path` strips `/em`, because em-server serves `/v1/...` at its root.
+	handle_path /em/* {
+		reverse_proxy em-server:8000
+	}
+
+	# The IIIF Image API. `handle` and NOT `handle_path`: the API version lives
+	# in the path (`/iiif/3/...`), so stripping the prefix would take the
+	# endpoint with it.
+	handle /iiif/* {
+		reverse_proxy cantaloupe:8182
+	}
+
+	# The object store, for clients that fetch an asset by its digest.
+	handle_path /assets/* {
+		reverse_proxy minio:9000
+	}
+
+	# Identity, on the same origin as everything else.
+	handle /auth/* {
+		reverse_proxy keycloak:8080
+	}
+
+	handle {
+		respond "em dev stack — try /em/v1/health, /iiif/3/<sha256>/info.json" 200
+	}
+}

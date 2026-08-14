@@ -125,6 +125,44 @@ services:
       - cantaloupe_cache:/var/cache/cantaloupe
     restart: unless-stopped
 
+
+  # =======================================================================
+  # HTTPS — the same Caddy, the same routes, as the production deployment
+  # =======================================================================
+  #
+  # Why a proxy on a laptop at all: two end-to-end proofs were blocked not by
+  # logic but by `http://localhost`. A hosted IIIF viewer cannot fetch a
+  # manifest over plain HTTP from an https page (mixed content), and a token in
+  # a query is only defensible behind TLS. So the dev stack grows the same shape
+  # the deployment has — one host, TLS terminated, routes by path — and the two
+  # stop differing in the one way that mattered.
+  #
+  # The certificate comes from **Caddy's own internal CA**. Trusting that CA is
+  # the one gesture this file cannot make for you: it needs the system keychain
+  # and therefore a password (see README-DEV). Without the trust step, curl
+  # works with `--cacert` and browsers do not — which is exactly the boundary,
+  # and the reason the staging host with a public certificate is the real
+  # answer.
+  #
+  #   docker compose --profile https --env-file .env.dev -f docker-compose.dev.yml up -d
+  caddy:
+    image: caddy:2-alpine
+    container_name: em-dev-caddy
+    profiles: ["https"]
+    depends_on:
+      - em-server
+      - cantaloupe
+      - minio
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data          # the internal CA lives here: keep it, or every
+      - caddy_config:/config      # restart mints a new root nobody trusts
+    environment:
+      EM_DEV_DOMAIN: "${EM_DEV_DOMAIN:-em.localhost}"
+    restart: unless-stopped
+
   # =======================================================================
   # IDENTITY — the same realm mechanism as production, seeded so a token is a
   # curl away instead of a click-through
@@ -210,6 +248,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  caddy_data:      # the internal CA + issued certs — losing it means re-trusting
+  caddy_config:
   minio_data:
   em_data:
   cantaloupe_cache:   # derivatives: a cache, recomputable — not study data

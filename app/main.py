@@ -324,8 +324,15 @@ async def iiif_manifest(room_id: str, target_id: str, request: Request,
     if not room.is_public:
         _authorise_manifest(request, token)
     graph, warnings = _room_graph(room)
-    # SPEAK on the internal form, WRITE the public one into the document
-    internal = (IIIF_INTERNAL if base == IIIF_PUBLIC else base) or base
+    # SPEAK on the internal form, WRITE the public one into the document.
+    #
+    # `?image_base=` chooses what goes INTO the manifest — a caller staging a
+    # different public host, for instance. It must NOT change how this process
+    # dials the image server: the internal address is a property of the
+    # deployment, not of the request. Getting that backwards is how a manifest
+    # asked for over https ended up with placeholder canvas sizes, because the
+    # server tried to reach itself through the public name.
+    internal = IIIF_INTERNAL or base
     sizes = _measure_images(graph, internal)
     try:
         manifest = em.iiif_manifest(graph, target_id, image_base=base,

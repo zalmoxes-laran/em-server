@@ -199,3 +199,49 @@ regions as **W3C Web Annotations**.
 **In EMStudio**: Settings → *Immagini (IIIF)* → `http://localhost:8182/iiif/3`.
 The shelf and the resource cards then show thumbnails, and the annotator loads
 the picture through the Image API.
+
+---
+
+## HTTPS in locale (profilo `https`) — la stessa forma dello staging
+
+Due prove end-to-end erano bloccate non dalla logica ma da `http://localhost`: un
+viewer IIIF ospitato non può leggere un manifest in chiaro da una pagina https
+(mixed-content), e un token in query si difende solo dietro TLS. Il dev-stack
+prende quindi **la stessa forma del deploy**: un host, TLS terminato da **Caddy**,
+rotte per path.
+
+```bash
+cd dev-stack
+docker compose --profile https --env-file .env.dev -f docker-compose.dev.yml up -d
+```
+
+| rotta | va a | uguale a produzione? |
+|---|---|---|
+| `https://em.localhost:8443/em/*` | em-server | sì (`handle_path`) |
+| `https://em.localhost:8443/iiif/*` | Cantaloupe | sì (`handle` — la versione sta nel path) |
+| `https://em.localhost:8443/assets/*` | MinIO | sì |
+| `https://em.localhost:8443/auth/*` | Keycloak | sì |
+
+Il certificato lo emette la **CA interna di Caddy**. È l'unico gesto che questo
+stack non può fare da sé, perché tocca il portachiavi di sistema:
+
+```bash
+# 1. estrai la radice (il volume la conserva fra i riavvii)
+docker cp em-dev-caddy:/data/caddy/pki/authorities/local/root.crt /tmp/caddy-root.crt
+
+# 2. senza fidarsi di nulla: curl la accetta su richiesta
+curl --cacert /tmp/caddy-root.crt https://em.localhost:8443/em/v1/health
+
+# 3. per il BROWSER serve la fiducia di sistema (chiede la password)
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain /tmp/caddy-root.crt
+```
+
+Senza il passo 3 `curl --cacert` funziona e i browser no — ed è esattamente il
+confine: **un host di staging con un certificato pubblico non ha questo
+problema**, ed è la stessa identica configurazione (stesso Caddy, stesse rotte,
+`heriverse-ansible/role/templates/Caddyfile.j2`) con un dominio vero. Accendere
+quell'host è un'azione ops; il percorso è provato qui.
+
+Nota: `em.localhost` risolve a 127.0.0.1 su macOS. Se la tua rete se lo mangia,
+`--resolve em.localhost:8443:127.0.0.1` per curl, o una riga in `/etc/hosts`.
