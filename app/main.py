@@ -254,6 +254,18 @@ def get_asset(room_id: str, ref: str) -> Response:
 # The older `EM_IIIF_BASE` / `EM_IIIF_INTERNAL_BASE` spellings are still read, in
 # that order: one setting with two names and a precedence, never two settings
 # that will one day disagree.
+#
+# And the rule has a HARD half, which is the one a request can attack:
+#
+#     the address em-server DIALS comes only from the CONFIG.
+#
+# A request parameter may, at most, change the URL WRITTEN INTO the document it
+# gets back. Never the outgoing call. The two are easy to conflate because they
+# name the same service — that conflation is exactly what `?image_base=` did
+# (`internal = IIIF_INTERNAL or base`, so a deployment with no IIIF configured
+# dialled whatever host the caller named), and it is why this is now stated
+# rather than assumed. `_measure_images` refuses an unconfigured base for the
+# same reason: no address is a fact to report, not a gap for a caller to fill.
 def _env_url(*names: str) -> str:
     for name in names:
         value = (os.environ.get(name) or "").strip()
@@ -332,8 +344,13 @@ async def iiif_manifest(room_id: str, target_id: str, request: Request,
     # deployment, not of the request. Getting that backwards is how a manifest
     # asked for over https ended up with placeholder canvas sizes, because the
     # server tried to reach itself through the public name.
-    internal = IIIF_INTERNAL or base
-    sizes = _measure_images(graph, internal)
+    #
+    # CONFIG ONLY — and no `or base` fallback. With one, a deployment that has
+    # no IIIF configured would dial whatever host the caller put in
+    # `?image_base=`: the request would be choosing where the server connects,
+    # which is the thing this must never allow. Unconfigured means unmeasured;
+    # the canvases then carry no size and the library says so.
+    sizes = _measure_images(graph, IIIF_INTERNAL) if IIIF_INTERNAL else {}
     try:
         manifest = em.iiif_manifest(graph, target_id, image_base=base,
                                     manifest_id=str(request.url).split("?")[0],
@@ -382,6 +399,11 @@ def _measure_images(graph: Any, base: str) -> Dict[str, Any]:
     cannot answer for gets no entry, and the library then says so in the
     manifest rather than pretending. A missing size costs an aspect ratio; a
     failed request must not cost the whole manifest.
+
+    `base` is the INTERNAL address and comes from the config — the guard below
+    is the second lock on the same door as the caller's: this function must not
+    become the place where a request-supplied host gets dialled just because
+    somebody passed it in one day.
     """
     import json as _json
     import urllib.error
@@ -389,6 +411,8 @@ def _measure_images(graph: Any, base: str) -> Dict[str, Any]:
 
     from s3dgraphy.iiif import image_identifier, is_image
 
+    if not base:
+        return {}
     sizes: Dict[str, Any] = {}
     for node in graph.nodes:
         if getattr(node, "node_type", "") != "resource" or not is_image(node):

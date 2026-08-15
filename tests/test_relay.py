@@ -14,6 +14,9 @@ The eight claims the design asks for before anybody builds a client on top:
   7  THE RULES      the relay contains no convergence/GC logic (it calls the
                     library), and the durable truth is not the process's disk
   8  s3Dgraphy      its own suite is unchanged (measured there, not here)
+  9  TOMBSTONES     the snapshot KEEPS the deletions (a client that joins without
+                    them cannot converge, only resurrect) — the KEEP half of the
+                    per-surface policy in `s3dgraphy.dissemination`
 
 The three fences of P4.2 are asserted, not assumed: truth outside the process
 (4, 7), convergence in the library (2, 7), presence ephemeral (6).
@@ -483,3 +486,59 @@ def test_7e_an_edge_op_keeps_its_endpoints(client, fresh_rooms):
     assert edge["source"] == "reg-1", "the edge starts where the client said"
     assert edge["target"] == "US1"
     assert edge["edge_type"] == "is_on_resource"
+
+
+# ── 9 · the snapshot KEEPS the tombstones ───────────────────────────────────
+#
+# The other half of the per-surface policy stated in `s3dgraphy.dissemination`:
+# a dissemination surface (GraphML, Heriverse, published RDF) must not carry a
+# deletion, and the surfaces where somebody still has to MERGE must. The room
+# snapshot is the strictest of those three — a client that joins without the
+# tombstones cannot converge, it can only resurrect what the others deleted,
+# and it would do so silently.
+
+def test_9_a_late_client_receives_the_deletions_too(client, fresh_rooms):
+    _seed(fresh_rooms)
+    with client.websocket_connect("/v1/rooms/scavo/ws") as a:
+        _drain_join(a)
+        a.send_json({"v": WIRE, "type": "op", "source": "test",
+                     "payload": {"op": "remove_node", "id": "US1", "ts": T2}})
+        assert a.receive_json()["payload"]["applied"] is True
+
+        with client.websocket_connect("/v1/rooms/scavo/ws") as late:
+            doc = _drain_join(late)
+
+    nodes = {n["id"]: n for n in doc["graphs"]["scavo"]["nodes"]}
+    assert "US1" in nodes, \
+        "a snapshot without the dead is a snapshot that resurrects them"
+    assert nodes["US1"]["data"]["removed"]["ts"] == T2
+    assert em.crdt_stats(doc)["node_tombstones"] == 1
+
+
+def test_9b_a_saved_room_keeps_a_deletion_somebody_has_not_seen(client,
+                                                                fresh_rooms):
+    """GC is the one thing allowed to drop a tombstone, and only past an instant
+    every participant has passed. A client whose watermark sits BEFORE the
+    deletion holds it back — otherwise "save" would quietly mean "forget who was
+    deleted" for whoever is still catching up.
+
+    The `ack` is not decoration: it is how a member says where it has got to,
+    and the compaction takes the MINIMUM across the connected members.
+    """
+    _seed(fresh_rooms)
+    with client.websocket_connect("/v1/rooms/scavo/ws") as a:
+        _drain_join(a)
+        # A declares it has only applied up to T1 — before the deletion below
+        a.send_json({"v": WIRE, "type": "ack", "source": "test",
+                     "payload": {"ts": T1}})
+        a.send_json({"v": WIRE, "type": "op", "source": "test",
+                     "payload": {"op": "remove_node", "id": "US1", "ts": T3}})
+        assert a.receive_json()["payload"]["applied"] is True
+        a.send_json({"v": WIRE, "type": "request_save", "source": "test",
+                     "payload": {}})
+        assert a.receive_json()["type"] == "snapshot_written"
+
+    stored = fresh_rooms.store.get("scavo")
+    nodes = {n["id"]: n for n in stored["graphs"]["scavo"]["nodes"]}
+    assert "US1" in nodes and "removed" in nodes["US1"]["data"], \
+        "the deletion was compacted away while a member was still behind it"

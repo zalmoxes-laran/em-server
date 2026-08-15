@@ -195,3 +195,130 @@ def test_2e_the_digest_is_the_capability():
     assert "room.is_public" in source
     assert "capability" in source.lower(), \
         "the docstring must say why the manifest is the gate"
+
+
+# ── 3 · no request parameter may drive the INTERNAL fetch ───────────────────
+#
+# The same class of bug as the wire's `source`: one name doing two jobs. Here
+# the two jobs are "which URL goes into the document" (public, and a caller may
+# legitimately have an opinion) and "which host this process connects to"
+# (internal, and a caller may not). `?image_base=` did both, and a deployment
+# with no IIIF configured would therefore dial whatever host the request named.
+# These tests are the enforcement: the parameter keeps its document job and
+# loses the other one.
+
+class _FakeInfo:
+    """Just enough of an HTTP response for `_measure_images`."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+@pytest.fixture()
+def dialled(monkeypatch):
+    """Record every URL the process actually opens — the real seam, not a stub
+    of `_measure_images`: what is under test is precisely that nothing between
+    the query string and the socket rewrites the host."""
+    import urllib.request
+
+    seen: list[str] = []
+
+    def fake_urlopen(url, *_args, **_kwargs):
+        seen.append(str(url))
+        return _FakeInfo(b'{"width": 1024, "height": 768}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def _manifest(client, room, query=""):
+    return client.get(f"/v1/rooms/{room}/iiif/img-1/manifest{query}")
+
+
+def test_3a_a_hostile_image_base_does_not_move_the_internal_fetch(
+        client, fresh_rooms, monkeypatch, dialled):
+    monkeypatch.setattr(main_module, "IIIF_PUBLIC", "https://em.example.org/iiif/3")
+    monkeypatch.setattr(main_module, "IIIF_INTERNAL", "http://cantaloupe:8182/iiif/3")
+    fresh_rooms.store.put("mostra", _document("mostra", "public"))
+
+    answer = _manifest(client, "mostra",
+                       "?image_base=http://attacker.example/iiif/3")
+    assert answer.status_code == 200, answer.text
+
+    assert dialled, "the server did measure the image"
+    for url in dialled:
+        assert url.startswith("http://cantaloupe:8182/iiif/3"), \
+            f"the request chose where the server connects: {url}"
+        assert "attacker.example" not in url
+
+    manifest = answer.json()
+    painted = manifest["items"][0]["items"][0]["items"][0]["body"]["id"]
+    assert painted.startswith("http://attacker.example/iiif/3"), \
+        "the parameter keeps its ONLY job: the URL written into the document"
+    canvas = manifest["items"][0]
+    assert (canvas["width"], canvas["height"]) == (1024, 768), \
+        "…and the size still comes from the internal measurement"
+
+
+def test_3b_with_nothing_configured_it_dials_nothing_at_all(
+        client, fresh_rooms, monkeypatch, dialled):
+    """The removed fallback, pinned. `internal = IIIF_INTERNAL or base` looked
+    harmless — it meant an unconfigured deployment used the caller's host."""
+    monkeypatch.setattr(main_module, "IIIF_PUBLIC", "")
+    monkeypatch.setattr(main_module, "IIIF_INTERNAL", "")
+    fresh_rooms.store.put("mostra", _document("mostra", "public"))
+
+    answer = _manifest(client, "mostra",
+                       "?image_base=http://attacker.example/iiif/3")
+    assert answer.status_code == 200, answer.text
+    assert dialled == [], "no configured address is a fact, not a gap to fill"
+
+
+def test_3c_measure_images_refuses_an_unconfigured_base(dialled):
+    """Second lock on the same door: even called directly, with the base that a
+    caller-supplied value would have produced, it does not dial."""
+    assert main_module._measure_images(object(), "") == {}
+    assert main_module._measure_images(object(), None) == {}
+    assert dialled == []
+
+
+def test_3d_the_only_outbound_calls_read_their_address_from_config():
+    """The audit, kept as a tripwire.
+
+    Two places in this service open a socket to another one: the JWKS fetch and
+    the `info.json` measurement. Both take their address from settings read at
+    startup. A third one arriving is not forbidden — it just has to arrive with
+    this test updated, which is the point.
+    """
+    import re
+
+    app_dir = _REPO / "app"
+    callers = {}
+    for path in sorted(app_dir.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if re.search(r"urlopen\(|httpx\.|requests\.(get|post)\(", source):
+            callers[path.name] = source
+    assert set(callers) == {"auth.py", "main.py"}, \
+        f"a new outbound call site appeared: {sorted(callers)}"
+
+    # the JWKS URI is a setting, and `kid` (which DOES come from the token)
+    # only picks a key out of what that setting returned
+    assert "_JwksCache(self.settings.jwks_uri)" in callers["auth.py"]
+    # and the image measurement is handed the config value, with no fallback
+    assert "_measure_images(graph, IIIF_INTERNAL) if IIIF_INTERNAL else {}" \
+        in callers["main.py"]
+    # comments stripped: the removed fallback is NAMED in the comment that
+    # explains why it went, and a tripwire that trips on its own explanation
+    # teaches people to delete the explanation
+    code = "\n".join(line for line in callers["main.py"].splitlines()
+                     if not line.lstrip().startswith("#"))
+    assert "IIIF_INTERNAL or base" not in code
