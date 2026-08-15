@@ -8,11 +8,23 @@ Part of the StratiGraph ecosystem (CNR ISPC, Horizon Europe GA 101232855) with
 [s3Dgraphy](../s3Dgraphy) (the reference implementation), EMStudio, EM-blender-tools
 and EMLab.
 
-> **Status: P0 complete — read-only, local, no auth, everything under `/v1`.**
-> The scaffold and the read endpoints, verified in a container against the published
-> `s3dgraphy 1.6.0.dev12`. Authentication (Keycloak + ORCID), the asset store
-> (MinIO), the op-log WebSocket and the deployment on the shared infrastructure are
-> **P1–P4**, and they land with 3DR on Heriverse-Docker. See *Roadmap* below.
+**Where this sits.** em-server is **the ROOM**: the graph *being edited right
+now*, the relay that carries operations between the people editing it, the assets
+that graph points at, and the IIIF manifests for its images. Its sibling
+[em-catalog](../em-catalog) is **the REGISTER**: the studies as *published*. Same
+bucket, same realm, different question.
+
+| you want to… | read |
+|---|---|
+| see how all the pieces stand together | [`docs/ARCHITECTURE-SYSTEM.md`](docs/ARCHITECTURE-SYSTEM.md) |
+| run the whole thing on a laptop | [`dev-stack/README-DEV.md`](dev-stack/README-DEV.md) |
+| deploy it on a real host | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
+| know which URL is internal and which public | [`docs/URL-TOPOLOGY.md`](docs/URL-TOPOLOGY.md) |
+
+> **Status: P0–P4.5.** Read endpoints, Keycloak auth, the MinIO asset store, the
+> IIIF image layer, the WIRE 2 envelope, the room relay and structural real-time
+> are all in and measured. What is left is ops (an institutional host) and the
+> halves declared in the reports under `.claude/wip/reports/`.
 
 ## The two rules that shape this repo
 
@@ -153,14 +165,20 @@ mapper a genuine token arrives with `aud: account` and is correctly refused with
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'          # + '.[all]' for TTL and reprojection
 
-# s3dgraphy from PyPI — dev12 is the first release with `api.py` AND the extras
-.venv/bin/pip install 's3dgraphy[geo,rdf]==1.6.0.dev12'
-# …or from the sibling checkout, while the language and the service move together:
-# .venv/bin/pip install -e ../s3Dgraphy
+# the sibling CHECKOUT, while the language and the service move together —
+# this is what a developer here wants, and what the dev stack mounts
+.venv/bin/pip install -e ../s3Dgraphy
+# …or the published wheel, for a run that does not track the library:
+# .venv/bin/pip install 's3dgraphy[geo,rdf]==1.6.0.dev12'
 
 .venv/bin/uvicorn app.main:app --reload --port 8000
-curl -s localhost:8000/v1/health | python3 -m json.tool
+curl -s localhost:8000/health | python3 -m json.tool
 ```
+
+A healthy local run answers `"auth": "dev-no-auth"` and two `memory` stores —
+correct for a laptop, and *said out loud* rather than assumed. For the same
+service with a real identity provider and a real object store next to it, use the
+[dev stack](dev-stack/README-DEV.md).
 
 Without s3dgraphy importable the app refuses to start and says how to fix it —
 deliberately, because a service that boots and then 500s on every request is worse
@@ -205,11 +223,15 @@ is a decision taken in the wrong place.
 >   `reproject: false`. dev12 declares both, so the pin alone is now enough and the
 >   Dockerfile no longer names rdflib/pyproj separately.
 
-## Tests, and how P0 was verified
+## Tests, and how this is verified
 
 ```bash
-.venv/bin/python -m pytest tests -q      # 15 passed, 2 skipped
+.venv/bin/python -m pytest -q      # 118 passed, 2 skipped (stack up)
 ```
+
+Ten of those skip instead of failing when the dev stack is **down** — they are the
+ones that talk to a real MinIO, and they say so by name. A skip means *not
+measured*, never *passed*.
 
 The tests skip rather than fail when an optional dependency is absent, and the
 inverse tests (501 without rdflib / without pyproj) run in that case instead — so

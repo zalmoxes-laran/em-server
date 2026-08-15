@@ -52,17 +52,26 @@ cp .env.dev.example .env.dev
 docker-compose --env-file .env.dev -f docker-compose.dev.yml up -d --build
 ```
 
-That builds em-server from its own `Dockerfile` and starts four things: MinIO, a
-one-shot that **creates the bucket**, Keycloak with the **dev realm imported**,
-and em-server pointed at both. First run takes a few minutes (the image build);
-after that it is seconds.
+That builds em-server and em-catalog from their own `Dockerfile`s and starts the
+rest: MinIO, a one-shot that **creates the bucket**, Keycloak with the **dev
+realm imported**, Cantaloupe for IIIF, and the two services pointed at all of
+them. First run takes a few minutes (the image builds); after that it is seconds
+— **~15 s** for a full `up -d`, measured.
 
 | what | where | credentials |
 |---|---|---|
-| em-server | <http://localhost:8000/v1/health> | a bearer token (below) |
+| em-server (the room) | <http://localhost:8000/v1/health> | a bearer token (below) |
+| em-catalog (the studies) | <http://localhost:8010/health> | idem |
 | MinIO console | <http://localhost:9001> | `minioadmin` / `minioadmin` |
 | MinIO API | <http://localhost:9000> | idem |
 | Keycloak | <http://localhost:8085> | `admin` / `admin` |
+| Cantaloupe (IIIF) | <http://localhost:8182/iiif/3> | none — public by design |
+
+Two more behind profiles: **Caddy** on <https://em.localhost:8443> (`--profile
+https`) and **CouchDB** on <http://localhost:5985> (`--profile couchdb`).
+
+> Verified on this machine with **Colima 0.10.3**, **Docker 29.6.1** and
+> **Docker Compose 5.3.0** (the standalone `docker-compose`).
 
 **Why 8085 and not 8080.** 8080 is a busy port on a developer's Mac — this one
 already had a Moodle container on it. Every port is a variable in `.env.dev`;
@@ -190,15 +199,95 @@ docker-compose --env-file .env.dev -f docker-compose.dev.yml --profile couchdb u
 
 ---
 
+## Relaunch — the three cases, and which one you want
+
+This is the part that gets forgotten between sessions, so here it is by symptom.
+All three were **executed on this machine**, in this order, and the timings are
+what they took here.
+
+### 1 · It was only stopped (`Exited 0`) → `start`
+
+```bash
+docker-compose --env-file .env.dev -f docker-compose.dev.yml start
+```
+
+**~6 seconds**, and **everything is still there**: the bucket, the room
+documents, the realm, the catalogue's studies. This is the normal morning
+command — the containers still exist, they were merely not running.
+
+You can tell this is your case because `docker-compose … ps -a` lists the
+containers with `Exited`.
+
+### 2 · The containers are gone, the data is not → `up -d`
+
+```bash
+docker-compose --env-file .env.dev -f docker-compose.dev.yml up -d
+```
+
+**~15 seconds.** `down` removes the containers and the network but **keeps the
+named volumes**, so `up -d` recreates the containers around the same data.
+Verified: after `down` + `up -d`, `mostra` still answers 200 and `scavo` still
+answers 401, and the IIIF smoke passes without re-uploading anything.
+
+Add `--build` when you changed a `Dockerfile` (not when you changed application
+code: `app/` is mounted).
+
+> **The profile trap.** `down` only touches the services of the profiles you
+> name. Bringing the stack down while the `couchdb` profile is up leaves that
+> container running and the network un-removable — the message is `Network
+> em-dev_default Resource is still in use`, which reads like a bug and is not.
+> Name the profiles when you mean everything:
+> `--profile https --profile couchdb down`.
+
+### 3 · The volumes were dropped too (`down -v`) → `up -d`, then re-seed
+
+```bash
+docker-compose --env-file .env.dev -f docker-compose.dev.yml up -d
+```
+
+What comes back **by itself**, because it is seeded by the stack: the **bucket**
+(the `minio-init` one-shot) and the **realm** (Keycloak's import). Measured
+straight after a `down -v`: `/v1/health` says `auth: keycloak` and
+`asset_store: minio (…)`.
+
+What does **not** come back, and how to put it back:
+
+```bash
+python dev-stack/smoke.py            # re-uploads a test asset, checks the arc
+python dev-stack/smoke_iiif.py       # re-uploads the demonstration IMAGE
+python dev-stack/seed_rooms.py       # the two rooms: mostra (public) / scavo (restricted)
+docker-compose --env-file .env.dev -f docker-compose.dev.yml restart em-server
+```
+
+The restart is needed because em-server reads a room's document when the room is
+first opened; a room it has already opened keeps what it had.
+
+Then the visibility rule answers again — this is the check that tells you the
+re-seed worked:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/v1/rooms/mostra/iiif/img-1/manifest  # 200
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/v1/rooms/scavo/iiif/img-1/manifest   # 401
+```
+
+Also gone with `-v`: **Caddy's internal CA** (`caddy_data`). If you had trusted
+it in the system keychain, that trust now points at a root that no longer exists
+— extract and trust the new one (see the https section below).
+
+---
+
 ## Down
 
 ```bash
-docker-compose --env-file .env.dev -f docker-compose.dev.yml down -v   # -v drops the volumes too
+docker-compose --env-file .env.dev -f docker-compose.dev.yml stop     # keep everything, fastest restart
+docker-compose --env-file .env.dev -f docker-compose.dev.yml down     # remove containers, KEEP the data
+docker-compose --env-file .env.dev -f docker-compose.dev.yml --profile https --profile couchdb down -v   # throw the data away
 colima stop                                                            # frees the VM's CPU/RAM
 ```
 
-`-v` throws away the bucket and the room documents. Leave it off to keep them
-between sessions.
+`-v` throws away the bucket, the room documents, the catalogue's index and the
+CA. Leave it off to keep them between sessions; reach for it when you want to
+prove the stack comes up from nothing (and then re-seed as in case 3 above).
 
 ---
 
