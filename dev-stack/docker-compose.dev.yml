@@ -247,7 +247,92 @@ services:
       - ../../s3Dgraphy/src:/srv/s3dgraphy-src:ro
     restart: unless-stopped
 
+  # =======================================================================
+  # THE CATALOG — studies (em.json containers) beside the rooms
+  #
+  # A separate service on purpose: em-server serves the ROOM (the graph being
+  # edited right now), em-catalog serves the STUDY (the container as published).
+  # They share the object store — one bucket, two prefixes — and the same realm,
+  # which is what makes "the study you catalogued is the study you edit" true in
+  # configuration and not only in prose.
+  #
+  # It is a REFERENCE implementation (see em-catalog/README.md): the production
+  # Catalog is 3DR's, on WP6's CouchDB. This one proves the contract runs.
+  # =======================================================================
+  em-catalog:
+    build:
+      context: ../../em-catalog
+      dockerfile: Dockerfile
+    image: em-catalog:dev
+    container_name: em-dev-catalog
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # --- identity: the SAME realm as em-server, and the same two variables --
+      OIDC_ISSUER: "http://localhost:${KEYCLOAK_PORT:-8085}/realms/${DEV_REALM}"
+      OIDC_JWKS_URI: "http://keycloak:8080/realms/${DEV_REALM}/protocol/openid-connect/certs"
+      OIDC_AUDIENCE: "${DEV_CLIENT_ID}"
+      # --- the studies: the SAME bucket as the assets, under `studies/` -------
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "${MINIO_BUCKET}"
+      # (no MINIO_SECURE: the scheme of the endpoint decides — `http://` means
+      # somebody chose plain. One fact, one place.)
+      # --- the library you are editing, first on the path --------------------
+      PYTHONPATH: "/srv/s3dgraphy-src"
+      # --- the index: DERIVED, so a volume is a convenience, not a safety net.
+      # Losing this file costs one POST /catalog/reindex.
+      EM_CATALOG_DB: "/srv/em-catalog-data/index.sqlite"
+      # Uncomment (and the `couchdb` service below) to exercise the DEPLOY index
+      # instead. It is chosen by being configured — never silently.
+      # COUCHDB_URL: "http://couchdb:5984"
+      # COUCHDB_USER: "${COUCHDB_USER:-admin}"
+      # COUCHDB_PASSWORD: "${COUCHDB_PASSWORD:-admin}"
+      # --- what to write into an "open in" answer ----------------------------
+      # The PUBLIC form, as everywhere: a deep link is fetched by somebody
+      # else's software, so it must name a host they can reach.
+      EM_CATALOG_PUBLIC_URL: "http://localhost:${EM_CATALOG_PORT:-8010}"
+      EM_CATALOG_EMSTUDIO_URL: "${EM_CATALOG_EMSTUDIO_URL:-http://localhost:5173}"
+    ports:
+      - "${EM_CATALOG_PORT:-8010}:8000"
+    volumes:
+      - em_catalog_data:/srv/em-catalog-data
+      # the code you are editing, on both sides of the line — same reason as
+      # em-server: an edit to a route must not need an image rebuild
+      - ../../em-catalog/app:/srv/em-catalog/app:ro
+      - ../../s3Dgraphy/src:/srv/s3dgraphy-src:ro
+    restart: unless-stopped
+
+  # The DEPLOY index, for the runs that want to exercise it. Off by default:
+  # the dev index is SQLite and needs nothing, and a CouchDB nobody asked for
+  # would be a container running for a code path this stack does not take.
+  #
+  #   docker-compose --env-file .env.dev -f docker-compose.dev.yml --profile couchdb up -d
+  couchdb:
+    image: couchdb:3
+    container_name: em-dev-couchdb
+    profiles: ["couchdb"]
+    environment:
+      COUCHDB_USER: "${COUCHDB_USER:-admin}"
+      COUCHDB_PASSWORD: "${COUCHDB_PASSWORD:-admin}"
+    ports:
+      - "${COUCHDB_PORT:-5984}:5984"
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5984/_up"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
 volumes:
+  em_catalog_data:   # the SQLite index — derivable, so losing it costs a reindex
+  couchdb_data:
   caddy_data:      # the internal CA + issued certs — losing it means re-trusting
   caddy_config:
   minio_data:

@@ -131,6 +131,65 @@ Anything it cannot measure is printed as `SKIPPED` with the reason. A skip means
 
 ---
 
+## The catalogue — studies beside the rooms
+
+`em-catalog` publishes **studies** (em.json containers) out of the same bucket,
+under the `studies/` prefix, against the same realm. It is a **reference**
+implementation of the contract 3DR will build the production Catalog against —
+see `em-catalog/README.md`.
+
+```bash
+docker-compose --env-file .env.dev -f docker-compose.dev.yml up -d --build em-catalog
+curl -s http://localhost:8010/health | python3 -m json.tool
+```
+
+**Register a study** (any em.json container; the card is derived from it, and
+`visibility` is read from its header — it is not a parameter):
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8085/realms/em-dev/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=em-server -d client_secret=em-dev-secret \
+  -d username=dev -d password=dev | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+curl -s -X POST http://localhost:8010/catalog/studies \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  --data-binary @my-study.em.json | python3 -m json.tool
+```
+
+**Search it**, in either view:
+
+```bash
+curl -s 'http://localhost:8010/catalog/studies?q=sarmizegetusa' | python3 -m json.tool
+curl -s 'http://localhost:8010/catalog/studies?view=hdt'        | python3 -m json.tool
+```
+
+A study whose header says `visibility: public` answers **without** a token; a
+restricted one is 401 without and 200 with. An anonymous listing shows the public
+studies rather than a 401 — discovery is the point — and does not leak the rest.
+
+**The smoke**, which is where the architecture is actually proved:
+
+```bash
+python dev-stack/smoke_catalog.py
+```
+
+It registers two studies, verifies the containers are objects in MinIO by opening
+the bucket itself, searches by author / text / digital twin, checks the HDT view
+groups two campaigns of one monument, fetches the container back byte-identical,
+checks that `/ttl` is in **publish mode** (a deleted US is absent from the
+triples while still present in the em.json), exercises the visibility rule, and
+finally **empties the index and rebuilds it from the object store** — the claim
+that the index is a projection, executed rather than asserted.
+
+To exercise the **deploy** index instead of the dev one, bring up CouchDB and
+uncomment the three `COUCHDB_*` lines in the `em-catalog` service:
+
+```bash
+docker-compose --env-file .env.dev -f docker-compose.dev.yml --profile couchdb up -d
+```
+
+---
+
 ## Down
 
 ```bash

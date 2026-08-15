@@ -27,6 +27,15 @@ https://{$EM_DEV_DOMAIN:em.localhost} {
 		reverse_proxy em-server:8000
 	}
 
+	# StratiGraph · the CATALOG (studies as published, beside the rooms above).
+	# `handle` and NOT `handle_path`: em-catalog serves `/catalog/...` at its
+	# root, so the prefix is part of the endpoint and stripping it would take
+	# the route with it — the same distinction as `/iiif` below, and the same
+	# trap.
+	handle /catalog/* {
+		reverse_proxy em-catalog:8000
+	}
+
 	# The IIIF Image API. `handle` and NOT `handle_path`: the API version lives
 	# in the path (`/iiif/3/...`), so stripping the prefix would take the
 	# endpoint with it.
@@ -45,6 +54,6 @@ https://{$EM_DEV_DOMAIN:em.localhost} {
 	}
 
 	handle {
-		respond "em dev stack — try /em/v1/health, /iiif/3/<sha256>/info.json" 200
+		respond "em dev stack — try /em/v1/health, /catalog/health, /iiif/3/<sha256>/info.json" 200
 	}
 }
