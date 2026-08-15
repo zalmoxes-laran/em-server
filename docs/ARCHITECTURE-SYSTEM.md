@@ -146,6 +146,22 @@ so that a `.blend` stops being both the workshop and the archive.
 
 **Repo:** [`EM-blender-tools`](../../EM-blender-tools)
 
+### Reading a study — the two renderings
+
+A study can be *read* as a narrative, and there are two ways to serve one. The
+difference is worth stating because it is a decision, not a duplication:
+
+* the **live viewer** (`GET /catalog/study/{id}/narrative`) resolves every embed
+  at render time. The 3D is navigable, the matrix says what the graph says today,
+  and a unit renamed this morning is renamed here. It obeys the study's own
+  visibility: a `public` study opens with no token.
+* the **static export** (HTML, Word, LaTeX) is a **snapshot**: the embeds are
+  resolved once and frozen, so the file can be e-mailed, archived and cited.
+
+Same NarrativeNode, same rendering engine, two outputs — and each one *says
+which it is*, in its own footer. A third rendering built separately would
+eventually disagree with the other two about what the study said.
+
 ### The infrastructure we did not invent
 
 | piece | what it is | why it is there |
