@@ -237,14 +237,25 @@ def test_the_openapi_schema_is_served():
     # has, and it is content-addressed (the same bytes are the same object), so
     # it creates rather than modifies.
     #
-    # What stays forbidden is what would make the service a mutable store:
-    # PATCH (change something in place) and DELETE (remove it). Nothing here
-    # takes anything away — the graph's own deletions are tombstones inside a
-    # document, not HTTP verbs.
+    # What stays forbidden is what would make the service a mutable DOCUMENT
+    # store: PATCH (change a study in place), or a DELETE that takes a study
+    # away. The graph's own deletions are tombstones inside a document, not HTTP
+    # verbs, and that has not changed.
+    #
+    # The membership routes are the deliberate exception, and they are the
+    # opposite kind of thing: an ACL is not the record of what was found, it is
+    # who may work on it — a grant that could be given and never revoked would
+    # be an access-control system with no way to correct a mistake. So a role is
+    # a PUT (state the role, idempotently) and a revocation is a DELETE, on a
+    # path that names a person and never a study.
     writes = {(verb.upper(), path) for path, ops in schema["paths"].items()
               for verb in ops if verb in ("put", "patch", "delete")}
-    assert writes == {("PUT", "/v1/rooms/{room_id}/asset")}, \
+    assert writes == {("PUT", "/v1/rooms/{room_id}/asset"),
+                      ("PUT", "/v1/rooms/{room_id}/members/{orcid}"),
+                      ("DELETE", "/v1/rooms/{room_id}/members/{orcid}")}, \
         f"unexpected write endpoints: {sorted(writes)}"
+    assert not [p for p in paths if p.endswith("/study") or p.endswith("/graph")], \
+        "no route may take a study away: the deletions are tombstones"
 
 
 # ── versioning: the promise the path makes (P0.1) ─────────────────────────────

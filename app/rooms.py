@@ -38,6 +38,9 @@ from .store import SnapshotStore, deep_copy
 #: leak with a good excuse.
 OPLOG_LIMIT = 512
 
+#: "not looked up yet", distinct from "looked up and there is none".
+_UNREAD = object()
+
 
 def now_iso() -> str:
     """The clock this server stamps with — UTC, seconds, the EM spelling."""
@@ -52,6 +55,12 @@ class Member:
     #: the ORCID (or subject) from the TOKEN, never what the client said it was
     author: Optional[str]
     display: str = ""
+    #: what this member may do here (`access.Role`). Resolved at the door and
+    #: carried, so the write gate is a comparison and not a second lookup —
+    #: re-resolving per message would let a revocation take effect mid-session
+    #: for some verbs and not others, which is worse than a rule that holds for
+    #: the length of a connection and is re-read when they come back.
+    role: Optional[Any] = None
     #: what this member has selected — the awareness channel, soft, no locks
     selection: List[str] = field(default_factory=list)
     #: the instant of the last operation this member has been sent. The minimum
@@ -60,8 +69,12 @@ class Member:
     joined_at: str = field(default_factory=now_iso)
 
     def as_presence(self) -> Dict[str, Any]:
+        # The role travels with presence too: "who is here" and "who may write"
+        # is one question for the person reading the roster, and a client that
+        # had to ask separately would draw a room where everybody looks alike.
         return {"id": self.connection_id, "author": self.author,
                 "display": self.display, "selection": list(self.selection),
+                "role": getattr(self.role, "value", self.role),
                 "joined_at": self.joined_at}
 
 
@@ -87,6 +100,9 @@ class Room:
         #: to know whether its own history is still reconcilable here: below this
         #: point the room no longer holds what a replay would argue with.
         self.compacted_upto: Optional[str] = None
+        #: lazily read, see the `embargo` property. `_UNREAD` and not None
+        #: because "no embargo" is an answer worth remembering too.
+        self._embargo: Any = _UNREAD
 
     # ── who may read this study ──────────────────────────────────────────────
 
@@ -113,12 +129,39 @@ class Room:
     def is_public(self) -> bool:
         return self.visibility == "public"
 
+    @property
+    def embargo(self) -> Optional[str]:
+        """The study's embargo, if it declares one — the room's temporal gate.
+
+        `header.embargo` first because it is cheap and it is where a room-level
+        embargo would be written; failing that, the graph-scope node the Catalog
+        reads (DP-65), through the library, so the door and the listing cannot
+        disagree about whether a study is still under embargo.
+
+        Computed once per room instance and remembered: it walks the container,
+        and a join is not the place to do that twice. A room that is dropped and
+        rebuilt (`forget`) reads it again.
+        """
+        if self._embargo is not _UNREAD:
+            return self._embargo
+        header = self.document.get("header") or {}
+        declared = header.get("embargo") or header.get("embargo_until")
+        if declared:
+            self._embargo = str(declared)
+            return self._embargo
+        try:
+            from s3dgraphy.study import study_metadata
+            self._embargo = study_metadata(self.document).get("embargo")
+        except Exception:      # an unreadable container declares no embargo
+            self._embargo = None
+        return self._embargo
+
     # ── membership ───────────────────────────────────────────────────────────
 
     def join(self, connection_id: str, socket: Any, author: Optional[str],
-             display: str = "") -> Member:
+             display: str = "", role: Any = None) -> Member:
         member = Member(connection_id=connection_id, author=author,
-                        display=display or (author or "anon"))
+                        display=display or (author or "anon"), role=role)
         self.members[connection_id] = member
         self.sockets[connection_id] = socket
         return member

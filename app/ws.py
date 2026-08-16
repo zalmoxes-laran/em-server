@@ -34,6 +34,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from . import access
+from .access import Acl, Role, acl_store_from_env
 from .auth import authenticator
 from .rooms import RoomRegistry, now_iso
 from .store import store_from_env
@@ -44,11 +46,24 @@ from .wire import WIRE, WireError, envelope, read
 SNAPSHOT_STORE = store_from_env()
 ROOMS = RoomRegistry(SNAPSHOT_STORE)
 
+#: Who may do what, per room. A separate store from the snapshots on purpose:
+#: the access list is operational and the study is scientific, and putting the
+#: ACL inside the em.json would ship an access-control list with the record of
+#: what was found (see `access.py`).
+ACL_STORE = acl_store_from_env()
+
 #: The wire version lives in `wire.py` now — one definition for every speaker in
 #: this process, so a bump cannot be half-applied.
 
 #: What this host calls itself in `host_info` — a client shows it in its footer.
 HOST_TOOL = "em-server (relay)"
+
+#: The verbs that CHANGE something and therefore need `editor` or better.
+#: `select` and `ack` are not here and must not be: awareness is not writing,
+#: and a viewer whose cursor nobody could see would be a ghost in the room.
+#: `request_snapshot` is a read — asking for the document again is what a
+#: viewer does when it loses its place.
+_WRITING_VERBS = frozenset({"op", "request_save", "command"})
 
 ws_router = APIRouter(prefix="/v1")
 
@@ -69,6 +84,66 @@ def _identity(claims: Dict[str, Any]) -> Optional[str]:
         if value:
             return str(value)
     return None
+
+
+def load_acl(room_id: str) -> Acl:
+    """This room's access list, read from the store every time it is asked.
+
+    Not cached: a grant or a revocation must take effect at the next door, and a
+    cache would need an invalidation channel between REST and the relay for no
+    gain — an ACL is read once per join and once per management call.
+    """
+    return Acl.from_dict(ACL_STORE.get(room_id))
+
+
+def save_acl(room_id: str, acl: Acl) -> None:
+    ACL_STORE.put(room_id, acl.as_dict())
+
+
+def authorize(room, author: Optional[str], *, dev_mode: bool = False
+              ) -> Optional[Role]:
+    """The role this person has in this room, or None for "not a member".
+
+    **Dev mode is `owner`, and that is not a loophole — it is the truth.** When
+    no OIDC is configured there are no identities: every connection is the same
+    anonymous nobody, `/v1/health` says `dev-no-auth`, and the door is already
+    open by construction. Resolving roles against an identity that does not
+    exist would be theatre — a lock drawn on a door with no wall. So a laptop
+    run gets the role that lets it do everything, exactly as before this module
+    existed, and authorisation begins the moment authentication does.
+
+    Also the place the **owner bootstrap** happens, and it happens once: a room
+    whose study names nobody has no one who can grant access to it, so the first
+    signed-in person through the door becomes the owner. It is written **in the
+    study's header** (that is where an owner belongs — it travels with the file)
+    *and* in the ACL (that is what this server reads at the next join), because
+    a bootstrap recorded in only one of the two is a bootstrap that disappears
+    the first time the other is restored.
+    """
+    if dev_mode:
+        return Role.OWNER
+    acl = load_acl(room.room_id)
+    if acl.owner is None:
+        declared = access.owner_from_document(room.document)
+        if declared:
+            acl.owner = declared
+            save_acl(room.room_id, acl)
+        elif author:
+            # nobody owns this room yet: the first authenticated arrival does
+            if access.claim_owner(room.document, author):
+                acl.owner = access.owner_from_document(room.document)
+                save_acl(room.room_id, acl)
+    return access.role_of(acl, author, room.visibility, embargo=room.embargo)
+
+
+async def _deny(websocket: WebSocket, member, verb: str, reason: str) -> None:
+    """Say no, out loud. A dropped message is indistinguishable from a network
+    fault, and the person on the other end deserves the difference."""
+    await _send(websocket, envelope("denied", {
+        "verb": verb, "reason": reason,
+        "role": getattr(member.role, "value", None),
+        "can_write": bool(member.role and member.role.can_write),
+    }, source="em-server"))
 
 
 async def _authenticate(websocket: WebSocket, token: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -110,15 +185,36 @@ async def room_socket(websocket: WebSocket, room_id: str,
     author = _identity(claims)
 
     room = await ROOMS.get(room_id)
+
+    # ── the door ────────────────────────────────────────────────────────────
+    # Authentication said WHO; this says WHETHER, and they are different
+    # questions. A valid token used to be enough to enter any room and write to
+    # it — the gap this closes.
+    role = authorize(room, author, dev_mode=bool(claims.get("em_dev_mode")))
+    if role is None:
+        code = access.refusal_code(author)
+        await websocket.close(
+            code=code,
+            reason=("not a member of this room" if code == 4403
+                    else "this room needs a signed-in member"))
+        return
+
     connection_id = uuid.uuid4().hex[:12]
     member = room.join(connection_id, websocket, author,
-                       display=str(claims.get("name") or author or "anon"))
+                       display=str(claims.get("name") or author or "anon"),
+                       role=role)
 
     # ── the join: who you are, what the room is, what you missed ─────────────
     await _send(websocket, envelope("host_info", {
                             "tool": HOST_TOOL, "file": room_id,
                             "room": room_id, "connection_id": connection_id,
                             "author": author,
+                            # WHAT YOU MAY DO, said at the door. A client that
+                            # has to discover it by being refused shows an
+                            # editing UI that does not work, which reads as a
+                            # broken app rather than as a room you may only read.
+                            "role": role.value,
+                            "can_write": role.can_write,
                             # P4.3 · the compaction point this room has passed.
                             # A client whose own base is OLDER than this cannot
                             # safely replay its history — what it would re-assert
@@ -179,6 +275,17 @@ async def room_socket(websocket: WebSocket, room_id: str,
 async def _handle(room, member, websocket: WebSocket, message: Dict[str, Any],
                   author: Optional[str]) -> None:
     kind, payload = read(message)          # …and a wrong version raises WireError
+
+    # ── the write gate ───────────────────────────────────────────────────────
+    # A viewer reads. Everything that CHANGES something — an operation, or the
+    # request that writes a snapshot — needs editor or better, and a refusal is
+    # a frame with a reason rather than a silence: a client that saw its edits
+    # vanish without a word would report a lost connection, and the room would
+    # get blamed for a rule it applied correctly.
+    if kind in _WRITING_VERBS and not (member.role and member.role.can_write):
+        await _deny(websocket, member, kind,
+                    "this room is read-only for your role")
+        return
 
     if kind == "op":
         # THE AUTHOR IS THE TOKEN'S, always. A client that names somebody else is

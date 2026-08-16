@@ -43,22 +43,21 @@ def client():
 
 @pytest.fixture()
 def fresh_rooms():
-    """A registry of its own — patched in BOTH modules that hold a reference.
+    """A registry of its own — ONE place to patch, now.
 
-    `main.py` does `from .ws import ROOMS`, which binds the object, not the
-    name: patching only `ws.ROOMS` leaves the HTTP routes talking to the
-    original registry. That is a footgun worth a sentence rather than a
-    debugging session.
+    This used to have to be set in two modules: `main.py` did
+    `from .ws import ROOMS`, which binds the object rather than the name, so
+    patching only `ws.ROOMS` left the HTTP routes talking to the original
+    registry. The footgun is gone — `main.rooms()` resolves `ws.ROOMS` when it
+    is asked — and this fixture is one line shorter for it.
     """
     registry = RoomRegistry(InMemorySnapshotStore())
-    previous_ws, previous_main = ws_module.ROOMS, main_module.ROOMS
+    previous_ws = ws_module.ROOMS
     ws_module.ROOMS = registry
-    main_module.ROOMS = registry
     try:
         yield registry
     finally:
         ws_module.ROOMS = previous_ws
-        main_module.ROOMS = previous_main
 
 
 def _document(room_id: str, visibility: str | None = None):
@@ -106,13 +105,13 @@ def test_1b_the_server_speaks_internal_and_writes_public(monkeypatch):
 
     registry = RoomRegistry(InMemorySnapshotStore())
     registry.store.put("scavo", _document("scavo", "public"))
-    previous_ws, previous_main = ws_module.ROOMS, main_module.ROOMS
-    ws_module.ROOMS = main_module.ROOMS = registry
+    previous_ws = ws_module.ROOMS
+    ws_module.ROOMS = registry
     try:
         with TestClient(app) as client:
             answer = client.get("/v1/rooms/scavo/iiif/img-1/manifest")
     finally:
-        ws_module.ROOMS, main_module.ROOMS = previous_ws, previous_main
+        ws_module.ROOMS = previous_ws
 
     assert answer.status_code == 200, answer.text
     assert dialled == ["http://cantaloupe:8182/iiif/3"], \

@@ -47,8 +47,22 @@ from fastapi import Request
 from .assets import ASSET_STORE, asset_ref_valid
 from .assets import describe as asset_describe
 from .auth import AuthDependency, authenticator
+from .access import Acl, Role, may_assign, parse_role
+from .access import describe as acl_describe
 from .store import describe as snapshot_describe
-from .ws import ROOMS, SNAPSHOT_STORE, ws_router
+from . import ws as _ws
+from .ws import ACL_STORE, SNAPSHOT_STORE, authorize, load_acl, save_acl, ws_router
+
+
+def rooms():
+    """The relay's room registry, resolved WHEN ASKED and not bound at import.
+
+    `from .ws import ROOMS` binds the object, so a test (or anything else) that
+    replaced `ws.ROOMS` left these HTTP routes talking to the original registry
+    — a footgun that has cost two debugging sessions and is documented in
+    `tests/test_topology_and_visibility.py`. One registry, one place to find it.
+    """
+    return _ws.ROOMS
 
 try:  # the whole point of the service; a clear failure beats a mysterious one
     from s3dgraphy import api as em
@@ -139,6 +153,10 @@ class Health(BaseModel):
     #: points at. An operator who reads "memory" knows their uploads die with the
     #: process, instead of finding out later.
     asset_store: str = "memory"
+    #: …and where the per-room ACCESS LISTS live. Same question again, asked of
+    #: the third piece of room state: a deployment whose grants die with the
+    #: process would silently re-open every restricted room on restart.
+    acl_store: str = "memory"
 
 
 @v1_public.get("/health", response_model=Health, tags=["meta"])
@@ -171,7 +189,8 @@ def health() -> Health:
         auth=authenticator.settings.describe(),
         snapshot_store=snapshot_describe(SNAPSHOT_STORE),
         asset_store=asset_describe(ASSET_STORE),
-        rooms=len(ROOMS.rooms()),
+        acl_store=acl_describe(ACL_STORE),
+        rooms=len(rooms().rooms()),
     )
 
 
@@ -218,9 +237,30 @@ async def put_asset(room_id: str, request: Request,
 
 
 @v1.get("/rooms/{room_id}/asset/{ref:path}", tags=["assets"])
-def get_asset(room_id: str, ref: str) -> Response:
-    """Fetch an asset by reference. The caller can verify what it got: the
-    reference IS the digest."""
+async def get_asset(room_id: str, ref: str, request: Request) -> Response:
+    """Fetch an asset by reference — if the graph says you may have it yet.
+
+    The caller can verify what it got: the reference IS the digest.
+
+    **The store consults the graph; it does not duplicate it.** An asset's
+    embargo is stated in the document (on its `ResourceNode`, or on the DTC
+    chunk that produced it) and read here through
+    `s3dgraphy.api.asset_rights` — never cached, because an embargo lives in a
+    text people edit and a remembered copy is wrong the first time somebody
+    changes their mind.
+
+    The rule, and it is the study's rule applied one level down: while an
+    embargo is running, these bytes are for the people who are working on them —
+    **editor and above**. A viewer or an anonymous caller gets **403 with the
+    date**, not a 404: pretending the file does not exist would be a lie the
+    caller can disprove by asking again in March.
+
+    The two embargoes COMPOUND, and the more restrictive wins: a room under a
+    study-level embargo already refuses at the door, and an asset may be
+    embargoed inside a study that is not.
+
+    An asset the graph says nothing about is served as it always was.
+    """
     if not asset_ref_valid(ref):
         raise HTTPException(status_code=400,
                             detail=f"not an asset reference: {ref!r} "
@@ -228,10 +268,76 @@ def get_asset(room_id: str, ref: str) -> Response:
     data = ASSET_STORE.get(ref)
     if data is None:
         raise HTTPException(status_code=404, detail=f"no asset {ref}")
+
+    rights = await _asset_rights(room_id, ref)
+    if rights and rights.get("embargo_active"):
+        role = await _role_in_room(room_id, request)
+        if role is None or not role.can_write:
+            raise HTTPException(
+                status_code=403,
+                detail=f"this asset is under embargo until "
+                       f"{rights.get('embargo')} — until then it is readable by "
+                       f"the people working on the study (editor and above)")
+
     meta = ASSET_STORE.head(ref) or {}
+    headers = {"ETag": f'"{ref}"'}
+    # The licence TRAVELS WITH THE BYTES. Not enforcement — a share-alike cannot
+    # be imposed by an HTTP header, and pretending otherwise would be worse than
+    # saying nothing. What this does is remove the excuse: whoever downloads
+    # this file has been told, in the same breath, what they may do with it.
+    if rights:
+        headers["X-EM-License"] = str(rights.get("license_effective") or "")
+        if rights.get("license_is_default"):
+            headers["X-EM-License-Default"] = "true"
+        if rights.get("embargo"):
+            headers["X-EM-Embargo"] = str(rights["embargo"])
+        authors = [a.get("orcid") or a.get("name") for a in rights.get("authors") or []]
+        if authors:
+            headers["X-EM-Author"] = ", ".join(str(a) for a in authors if a)
     return Response(content=data,
                     media_type=str(meta.get("media_type") or "application/octet-stream"),
-                    headers={"ETag": f'"{ref}"'})
+                    headers=headers)
+
+
+async def _asset_rights(room_id: str, ref: str) -> Optional[Dict[str, Any]]:
+    """What this room's graph says about these bytes, or None.
+
+    Failing to READ the graph must not decide the question either way: it is
+    reported as "nothing said", which serves the asset — the same behaviour as
+    before this gate existed, rather than a room that locks itself because a
+    document is malformed.
+    """
+    try:
+        room = await rooms().get(room_id)
+        return em.asset_rights(room.document, ref)
+    except Exception:  # noqa: BLE001 — an unreadable graph states no embargo
+        return None
+
+
+async def _role_in_room(room_id: str, request: Request):
+    """The caller's role here, from an OPTIONAL token.
+
+    Optional because an asset URL is fetched by things that cannot log in, and
+    because a public study's assets are public. No token is not an error at this
+    point — it simply resolves to whatever a stranger gets, which the embargo
+    rule then judges.
+    """
+    header = request.headers.get("authorization") or ""
+    token = request.query_params.get("token")
+    claims: Dict[str, Any] = {}
+    if not authenticator.settings.enforcing:
+        claims = {"em_dev_mode": True}
+    elif header.lower().startswith("bearer ") or token:
+        try:
+            claims = (authenticator.require_token(request)
+                      if header.lower().startswith("bearer ")
+                      else authenticator.verify(str(token).strip()))
+        except Exception:  # noqa: BLE001 — a bad token is simply not an identity
+            claims = {}
+    orcid = None if claims.get("em_dev_mode") else (
+        claims.get("orcid") or claims.get("preferred_username") or claims.get("sub"))
+    room = await rooms().get(room_id)
+    return authorize(room, orcid, dev_mode=bool(claims.get("em_dev_mode")))
 
 
 # ── IIIF: the manifest of a room's image or document ──────────────────────────
@@ -332,7 +438,7 @@ async def iiif_manifest(room_id: str, target_id: str, request: Request,
                    "?image_base=. A manifest pointing at nothing would look "
                    "like a broken image rather than a missing service.")
 
-    room = await ROOMS.get(room_id)
+    room = await rooms().get(room_id)
     if not room.is_public:
         _authorise_manifest(request, token)
     graph, warnings = _room_graph(room)
@@ -352,9 +458,13 @@ async def iiif_manifest(room_id: str, target_id: str, request: Request,
     # the canvases then carry no size and the library says so.
     sizes = _measure_images(graph, IIIF_INTERNAL) if IIIF_INTERNAL else {}
     try:
+        # The whole DOCUMENT goes in, not just the graph: the rights of an image
+        # may be stated on a DTC chunk in another section of the container, and a
+        # manifest that read only the active graph would publish an embargoed
+        # picture because the embargo was written next door.
         manifest = em.iiif_manifest(graph, target_id, image_base=base,
                                     manifest_id=str(request.url).split("?")[0],
-                                    sizes=sizes)
+                                    sizes=sizes, document=room.document)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from None
     if warnings:
@@ -572,6 +682,136 @@ class AuthorityRequest(BaseModel):
 def resolve_authority_post(req: AuthorityRequest) -> Dict[str, Any]:
     """The same op as POST — em-bridge offers both verbs and so does this."""
     return _resolve_authority(req.term, req.facet)
+
+
+# ── who may work in a room (P5 · access control) ──────────────────────────────
+#
+# The relay enforces the roles; these routes are how they get handed out. They
+# are deliberately small: an ACL is a map from ORCID to role, and every rule
+# beyond that lives in `access.py::may_assign`, in one place, so a refusal here
+# and a refusal at the door cannot disagree.
+#
+# Every refusal is a **403 with the reason**. "Forbidden" on its own is what
+# makes people file bugs against a working access-control system.
+
+class MemberIn(BaseModel):
+    role: str = Field(description="viewer · editor · admin · owner")
+
+
+class MemberOut(BaseModel):
+    orcid: str
+    role: str
+
+
+class Members(BaseModel):
+    room: str
+    owner: Optional[str] = None
+    members: List[MemberOut] = Field(default_factory=list)
+    #: what the CALLER may do here — so a UI can draw the right buttons without
+    #: a second request, and without guessing from the absence of an error
+    your_role: Optional[str] = None
+
+
+async def _acting_role(room_id: str, request: Request) -> tuple:
+    """(acl, room, the caller's role) — or a 403 saying why not.
+
+    Resolved exactly the way the WebSocket door resolves it (same `authorize`),
+    because two implementations of "who are you here" is one more than the
+    number that can stay right.
+    """
+    principal = authenticator.require_token(request)
+    dev_mode = bool(principal.get("em_dev_mode"))
+    orcid = None if dev_mode else (principal.get("orcid")
+                                   or principal.get("preferred_username")
+                                   or principal.get("sub"))
+    room = await rooms().get(room_id)
+    role = authorize(room, orcid, dev_mode=dev_mode)
+    return load_acl(room_id), room, role, orcid
+
+
+@v1.get("/rooms/{room_id}/members", response_model=Members, tags=["access"])
+async def list_members(room_id: str, request: Request) -> Members:
+    """Who may work in this room. Owner and admins only.
+
+    Not public, and not for editors either: a membership list is a list of the
+    people working on an unpublished study, which is somebody's business rather
+    than everybody's.
+    """
+    acl, _room, role, _who = await _acting_role(room_id, request)
+    if role is None or not role.can_manage:
+        raise HTTPException(status_code=403,
+                            detail="reading the member list needs admin or owner")
+    return Members(room=room_id, owner=acl.owner,
+                   members=[MemberOut(orcid=k, role=v.value)
+                            for k, v in sorted(acl.members.items())],
+                   your_role=role.value)
+
+
+@v1.put("/rooms/{room_id}/members/{orcid}", response_model=Members, tags=["access"])
+async def set_member(room_id: str, orcid: str, body: MemberIn,
+                     request: Request) -> Members:
+    """Give somebody a role — or move the room to a new owner.
+
+    `owner` is a **transfer**, not a second owner: a room has one, the previous
+    owner is left as an admin (losing the room should not lock the person who
+    built it out of it), and only the owner may do it.
+    """
+    acl, room, role, _who = await _acting_role(room_id, request)
+    wanted = parse_role(body.role)
+    if wanted is None:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown role {body.role!r}: "
+                                   f"expected viewer, editor, admin or owner")
+    target = orcid.strip()
+    current = acl.members.get(target) or (Role.OWNER if acl.owner == target else None)
+    refusal = may_assign(role, current, wanted)
+    if refusal:
+        raise HTTPException(status_code=403, detail=refusal)
+
+    if wanted is Role.OWNER:
+        previous = acl.owner
+        acl.owner = target
+        acl.members.pop(target, None)
+        if previous and previous != target:
+            acl.members[previous] = Role.ADMIN
+        # the study carries its owner too (that is where an owner belongs), so
+        # the header follows the ACL rather than drifting behind it
+        header = room.document.setdefault("header", {})
+        if isinstance(header, dict):
+            header["owner"] = target
+    else:
+        if acl.owner == target:
+            raise HTTPException(
+                status_code=403,
+                detail="the owner cannot be demoted; transfer the room first")
+        acl.members[target] = wanted
+    save_acl(room_id, acl)
+    return Members(room=room_id, owner=acl.owner,
+                   members=[MemberOut(orcid=k, role=v.value)
+                            for k, v in sorted(acl.members.items())],
+                   your_role=role.value)
+
+
+@v1.delete("/rooms/{room_id}/members/{orcid}", response_model=Members,
+           tags=["access"])
+async def remove_member(room_id: str, orcid: str, request: Request) -> Members:
+    """Revoke a role. Removing somebody who has none is not an error — the
+    requested state (this person has no grant here) is the state that results."""
+    acl, _room, role, _who = await _acting_role(room_id, request)
+    target = orcid.strip()
+    if acl.owner == target:
+        raise HTTPException(status_code=403,
+                            detail="the owner cannot be removed; transfer the "
+                                   "room to somebody else first")
+    refusal = may_assign(role, acl.members.get(target), None)
+    if refusal:
+        raise HTTPException(status_code=403, detail=refusal)
+    acl.members.pop(target, None)
+    save_acl(room_id, acl)
+    return Members(room=room_id, owner=acl.owner,
+                   members=[MemberOut(orcid=k, role=v.value)
+                            for k, v in sorted(acl.members.items())],
+                   your_role=role.value)
 
 
 app.include_router(v1_public)
