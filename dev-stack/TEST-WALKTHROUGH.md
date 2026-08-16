@@ -29,13 +29,45 @@ non si fidano della parola di em-server).
   public = senza token, restricted = 401).
 
 ## Tappa 4 — EMStudio come client (rete locale)
-EMStudio non è nella stack: è il client.
+EMStudio non è nella stack: è il client. Serve una stanza da aprire, un token, e la CA fidata
+(`./fcn-trust-ca.sh`, senza la quale il `wss://` non si apre e sembra un server muto).
 
-    cd ~/Documents/GitHub/EMStudio/frontend && npm run serve
+**1 · la stanza** (da `~/Documents/GitHub/em-server`):
 
-Poi in EMStudio connettiti alla room dell'FCN: https://em.localhost:8443/em
-Test forte: un **secondo** EMStudio sull'altro Mac (via il nome Bonjour `<mac>.local`, non un IP) sulla stessa
-room → editi di qua, compare di là in tempo reale.
+    python3 dev-stack/seed_rooms.py     # crea `basilica-demo`: 6 US e 5 rapporti
+
+Idempotente, e la stanza di lavoro **non viene sovrascritta** se c'è già (`--force` per rifarla): le altre due
+(`mostra`/`scavo`) sono fixture, questa è dove si lavora.
+
+**2 · il token** (700 caratteri, non si digita):
+
+    ./dev-stack/token.sh | pbcopy       # negli appunti
+    ./dev-stack/token.sh --claims       # cosa c'è dentro, quando una stanza risponde 4401
+
+Dura un'ora: se la stanza smette di accettarlo, è la scadenza, non un guasto.
+
+**3 · EMStudio** (da `~/Documents/GitHub/EMStudio/frontend`; `npm run serve` serve la `dist/`, quindi
+`npm run build` almeno una volta):
+
+    npm run build && npm run serve      # → http://localhost:4173
+
+Nell'app, in quest'ordine:
+- **Impostazioni ▸ Live sync** → `URL` = `https://em.localhost:8443/em` (la BASE, non l'endpoint: il
+  `/v1/rooms/<stanza>/ws` lo compone `hub.ts`), `Stanza` = `basilica-demo`;
+- poi il pulsante **Mode ▸ Hub** nella toolbar: **è lì che l'app chiede il token**, con un prompt del browser.
+  Non è un campo delle impostazioni di proposito — il token vive in memoria per la sessione e non viene scritto
+  da nessuna parte (`main.ts:4813`, `hubToken`).
+
+**4 · la prova senza mani** (da `EMStudio/frontend`, usa il client VERO — `SyncClient` e `roomUrl`):
+
+    node scripts/check-room-live.mjs    # due client, un edit, la presenza: 17 check
+
+Prende il token da `dev-stack/token.sh` e la CA da `~/caddy-em-root.crt` da sé. Per provare la porta diretta
+invece di Caddy: `EM_HUB_BASE=http://localhost:8000 node scripts/check-room-live.mjs`.
+
+**5 · il test forte, a due macchine**: un **secondo** EMStudio sull'altro Mac, `./fcn-up.sh <mac>.local` (il nome
+Bonjour, mai un IP nudo → rompe il TLS della CA interna), stessa stanza `basilica-demo` → editi di qua, compare
+di là in tempo reale. Sull'altro Mac va copiato e fidato anche `caddy-em-root.crt`.
 
 ## Note
 - La ROOT `/` è vuota: apri percorsi veri (`/em/v1/health`, `/catalog/…`, `/iiif/…`).

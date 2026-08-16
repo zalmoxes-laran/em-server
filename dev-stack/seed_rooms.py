@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Seed the two demonstration rooms — the ones the visibility rule is shown on.
+"""Seed the demonstration rooms — the visibility pair, and the room to work in.
 
     python dev-stack/seed_rooms.py
+    python dev-stack/seed_rooms.py --force     # …overwriting the work room too
 
 `mostra` is `visibility: public` and `scavo` is `restricted`. They are the same
 study twice, on purpose: the ONLY difference between them is that one word in the
 header, so a probe of the two answers the question "what does publishing change?"
 without any other variable moving.
+
+`basilica-demo` is a third room, and a different KIND of thing: a small
+stratigraphy for two EMStudio clients to meet in (walkthrough Tappa 4). Which is
+why it is **preserved and not overwritten** on a re-run — the other two are
+fixtures nobody edits, this one is where somebody's editing happens, and a seed
+that silently replaced a morning's work would be the worst kind of idempotent.
+`--force` overwrites it, deliberately and out loud.
 
     curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8000/v1/rooms/mostra/iiif/img-1/manifest   # 200
     curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:8000/v1/rooms/scavo/iiif/img-1/manifest    # 401
@@ -71,13 +79,72 @@ def document(room_id: str, name: str, visibility: str) -> dict:
     }
 
 
+def work_room(room_id: str, name: str) -> dict:
+    """A small stratigraphy — the room two clients meet in.
+
+    Not annotated regions this time but **units and a relation**, because what
+    Tappa 4 shows is one person editing and another seeing it: that needs a
+    graph somebody can rename a node in, and a matrix that redraws when they do.
+
+    Small on purpose. Six units and five relations are enough to see an edit
+    arrive; a hundred would only make the screen harder to read.
+
+    Node and edge shapes are literal here — the same idiom as the fixtures above
+    — and they are the shapes s3Dgraphy's importer builds (`node_type: "US"`,
+    `edge_type: "is_before"`, measured against `StratigraphicUnit`), not a guess.
+    """
+    units = [
+        ("US1", "US 1", "Crollo di tegole sul piano di calpestio."),
+        ("US2", "US 2", "Piano in cocciopesto, integro nel settore nord."),
+        ("US3", "US 3", "Muro perimetrale est, opera mista."),
+        ("US4", "US 4", "Fossa di spoliazione lungo il muro est."),
+        ("US5", "US 5", "Riempimento della fossa, terra e frammenti."),
+        ("US6", "US 6", "Fondazione del muro perimetrale."),
+    ]
+    #: `is_before` = the source is EARLIER. Read them as a sequence: the collapse
+    #: sits on the floor, the floor abuts the wall, the robbing cuts the wall.
+    relations = [("US1", "US2"), ("US2", "US3"), ("US4", "US3"),
+                 ("US5", "US4"), ("US3", "US6")]
+    return {
+        "header": {"format": "em.json", "version": "1.0",
+                   "visibility": "restricted",
+                   "description": "Dato di dimostrazione, non uno scavo."},
+        "graphs": {room_id: {
+            "graph_id": room_id,
+            "name": name,
+            "nodes": [
+                {"id": unit, "node_type": "US", "name": label,
+                 "description": description}
+                for unit, label, description in units
+            ],
+            "edges": [
+                {"id": f"{a}__is_before__{b}", "source": a, "target": b,
+                 "edge_type": "is_before"}
+                for a, b in relations
+            ],
+        }},
+        "active_graph_id": room_id,
+    }
+
+
+#: `preserve` = written only when the room is not there yet. See the module
+#: docstring: a fixture is meant to be rewritten, a room somebody works in is not.
 ROOMS = (
-    ("mostra", "Mostra (dissemination)", "public"),
-    ("scavo", "Scavo (in corso)", "restricted"),
+    ("mostra", "Mostra (dissemination)", "public", document, False),
+    ("scavo", "Scavo (in corso)", "restricted", document, False),
+    ("basilica-demo", "Basilica · saggio dimostrativo", None, work_room, True),
 )
 
 
+def exists(room_id: str) -> bool:
+    """Is this room already written? Asked of the VOLUME, which is where it is."""
+    return subprocess.run(
+        ["docker", "exec", CONTAINER, "test", "-f",
+         f"{SNAPSHOT_DIR}/{room_id}.em.json"], capture_output=True).returncode == 0
+
+
 def main() -> int:
+    force = "--force" in sys.argv
     try:
         subprocess.run(["docker", "inspect", CONTAINER], check=True,
                        capture_output=True)
@@ -87,9 +154,14 @@ def main() -> int:
               f"-f docker-compose.dev.yml up -d")
         return 2
 
-    for room_id, name, visibility in ROOMS:
-        payload = json.dumps(document(room_id, name, visibility),
-                             ensure_ascii=False)
+    for room_id, name, visibility, build, preserve in ROOMS:
+        if preserve and not force and exists(room_id):
+            print(f"[ kept ] {room_id} — c'era già, non l'ho toccata "
+                  f"(--force per riscriverla)")
+            continue
+        payload = json.dumps(
+            build(room_id, name, visibility) if visibility is not None
+            else build(room_id, name), ensure_ascii=False)
         # `sh -c` with the JSON on stdin: no quoting of a document into an
         # argv, which is where this kind of script usually breaks.
         #
@@ -107,14 +179,43 @@ def main() -> int:
         if result.returncode != 0:
             print(f"[ FAIL ] {room_id}: {result.stderr.decode().strip()}")
             return 1
-        print(f"[  ok  ] {room_id} — visibility: {visibility}")
+        print(f"[  ok  ] {room_id} — visibility: {visibility or 'restricted'}")
 
     print("\nem-server reads a room's document when the room is first opened, so "
           "a room that was already live in this process keeps what it had.\n"
           "Restart it if you have just changed a seed:\n"
           "  docker-compose --env-file .env.dev -f docker-compose.dev.yml "
           "restart em-server")
+    print("\nPer Tappa 4 (EMStudio come client), da incollare in "
+          "Impostazioni ▸ Live sync:")
+    print(f"  URL     https://{env_domain()}:{env_https_port()}/em")
+    print(f"  Stanza  basilica-demo")
+    print("  Token   ./dev-stack/token.sh   (il campo lo chiede Mode ▸ Hub)")
     return 0
+
+
+def env_domain() -> str:
+    return _env("EM_DEV_DOMAIN", "em.localhost")
+
+
+def env_https_port() -> str:
+    return _env("HTTPS_PORT", "8443")
+
+
+def _env(name: str, default: str) -> str:
+    """Read `.env.dev` without importing anything: this script deliberately has
+    no dependencies, so that it works while the stack is half-up."""
+    import os
+    import pathlib
+    if os.environ.get(name):
+        return os.environ[name]
+    path = pathlib.Path(__file__).resolve().parent / ".env.dev"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.strip().partition("=")
+            if key.strip() == name and value.strip():
+                return value.strip()
+    return default
 
 
 if __name__ == "__main__":
