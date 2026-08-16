@@ -98,6 +98,13 @@ class DirectorySnapshotStore:
                        encoding="utf-8")
         tmp.replace(path)     # atomic: a reader never sees half a snapshot
 
+    def rooms(self) -> list[str]:
+        """Which rooms this directory holds. Same method the memory store has —
+        the IIIF gate asks it, because a image request carries no room id and
+        the question has to be put to every room there is."""
+        return sorted(p.name[: -len(".em.json")]
+                      for p in self.root.glob("*.em.json"))
+
 
 class MinioSnapshotStore:
     """The deployment target — **not implemented tonight, and it says so.**

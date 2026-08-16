@@ -64,6 +64,16 @@ def rooms():
     """
     return _ws.ROOMS
 
+
+def snapshot_store():
+    """The snapshot store, resolved when asked — same reason as `rooms()`.
+
+    Binding it at import is how `_rooms_holding` ended up asking a store nobody
+    was using: the gate looked correct and let an embargoed asset through in a
+    test that had replaced the store. One accessor, one footgun less.
+    """
+    return _ws.SNAPSHOT_STORE
+
 try:  # the whole point of the service; a clear failure beats a mysterious one
     from s3dgraphy import api as em
 except ImportError as exc:  # pragma: no cover — deployment error, not runtime
@@ -187,7 +197,7 @@ def health() -> Health:
             "resolve_authority": bool(em.authority_facets()),
         },
         auth=authenticator.settings.describe(),
-        snapshot_store=snapshot_describe(SNAPSHOT_STORE),
+        snapshot_store=snapshot_describe(snapshot_store()),
         asset_store=asset_describe(ASSET_STORE),
         acl_store=acl_describe(ACL_STORE),
         rooms=len(rooms().rooms()),
@@ -269,15 +279,14 @@ async def get_asset(room_id: str, ref: str, request: Request) -> Response:
     if data is None:
         raise HTTPException(status_code=404, detail=f"no asset {ref}")
 
-    rights = await _asset_rights(room_id, ref)
-    if rights and rights.get("embargo_active"):
-        role = await _role_in_room(room_id, request)
-        if role is None or not role.can_write:
-            raise HTTPException(
-                status_code=403,
-                detail=f"this asset is under embargo until "
-                       f"{rights.get('embargo')} — until then it is readable by "
-                       f"the people working on the study (editor and above)")
+    # THE NAMED ROOM FIRST, then everybody else — because the store is shared.
+    #
+    # Measured, and it was a hole big enough to make the rest theatre: the same
+    # digest requested through a DIFFERENT room came back 200, since the embargo
+    # is stated in the graph of the room that holds the picture and the asset
+    # store is not partitioned by room. A gate you get past by typing another
+    # room name is not a gate.
+    rights = await _rights_seen_anywhere(room_id, ref, request)
 
     meta = ASSET_STORE.head(ref) or {}
     headers = {"ETag": f'"{ref}"'}
@@ -300,18 +309,86 @@ async def get_asset(room_id: str, ref: str, request: Request) -> Response:
 
 
 async def _asset_rights(room_id: str, ref: str) -> Optional[Dict[str, Any]]:
-    """What this room's graph says about these bytes, or None.
+    """What this room's graph says about these bytes, or None for "nothing".
 
-    Failing to READ the graph must not decide the question either way: it is
-    reported as "nothing said", which serves the asset — the same behaviour as
-    before this gate existed, rather than a room that locks itself because a
-    document is malformed.
+    **FAIL-CLOSED.** There are three outcomes and only two of them are answers:
+
+    * *(i)* the graph was read and says nothing about this digest → `None`, and
+      the caller serves the bytes. No regression: an asset with no DTC behaves
+      exactly as it always has;
+    * *(ii)* the graph was read and states an embargo → the rights, and the
+      caller applies the gate;
+    * *(iii)* **the graph could not be read at all** → this raises, and the
+      caller answers 503. It used to return `None` here, which meant "nothing
+      said", which meant *serve* — so a room whose document was corrupt, or a
+      store that was briefly unreachable, published every embargoed file in it.
+
+    (iii) is the whole point of this function existing separately: whether an
+    asset is embargoed is **unknowable without the graph**, so "I cannot read
+    the graph" must not be allowed to answer the question. The failure of a
+    store is a reason to say *not now*, never a reason to say *yes*.
+
+    A room nobody has ever written is case (i), not (iii), and that is
+    deliberate: it has no document in which an embargo could be hiding, and the
+    asset store is shared across rooms rather than partitioned by them. Making
+    it a 404 would break the one path that proves this — `smoke.py` uploads to a
+    room it never opens — while protecting nothing, because any room that DOES
+    exist would still serve the same bytes.
     """
-    try:
-        room = await rooms().get(room_id)
-        return em.asset_rights(room.document, ref)
-    except Exception:  # noqa: BLE001 — an unreadable graph states no embargo
-        return None
+    room = await rooms().get(room_id)      # may raise: the store is not here
+    return em.asset_rights(room.document, ref)
+
+
+async def _rights_seen_anywhere(room_id: str, ref: str,
+                                request: Request) -> Optional[Dict[str, Any]]:
+    """The rights to REPORT, having refused if any room forbids this caller.
+
+    Asks the named room first — it is the one the caller meant, and its answer
+    is the one whose licence belongs in the headers. Then, only if nothing has
+    refused yet, the other rooms this instance holds, because a digest is
+    content and the same picture can be cited in several studies; an embargo
+    stated in one of them is stated about these bytes.
+
+    Raises 403 (embargoed, and this caller is not editor+ **there** — the role
+    is resolved in the room that made the statement, which is the room that can
+    grant it) or 503 (a document that will not read: see `_asset_rights`).
+
+    The declared cost: on a big instance this reads every room's document. It is
+    bounded by the rooms one instance owns, and a deployment that minds can pass
+    the room explicitly. Correct-and-slow beats fast-and-bypassable.
+    """
+    first: Optional[Dict[str, Any]] = None
+    checked: List[str] = []
+    for candidate in [room_id] + [r for r in _rooms_holding(_digest_of(ref))
+                                  if r != room_id]:
+        try:
+            rights = await _asset_rights(candidate, ref)
+        except Exception as exc:  # noqa: BLE001 — case (iii), fail-closed
+            raise HTTPException(
+                status_code=503,
+                detail=f"cannot verify this asset's rights right now: the room "
+                       f"{candidate!r} has a document that will not read "
+                       f"({type(exc).__name__}). The bytes are not served until "
+                       f"it does — an embargo that cannot be read is not an "
+                       f"embargo that can be ignored.") from None
+        checked.append(candidate)
+        if candidate == room_id:
+            first = rights
+        if not rights or not rights.get("embargo_active"):
+            continue
+        role = await _role_in_room(candidate, request)
+        if role is not None and role.can_write:
+            continue
+        raise HTTPException(
+            status_code=403,
+            detail=f"this asset is under embargo until {rights.get('embargo')} "
+                   f"— until then it is readable by the people working on the "
+                   f"study (editor and above)")
+    return first
+
+
+def _digest_of(ref: str) -> str:
+    return str(ref).rsplit(":", 1)[-1].lower()
 
 
 async def _role_in_room(room_id: str, request: Request):
@@ -338,6 +415,118 @@ async def _role_in_room(room_id: str, request: Request):
         claims.get("orcid") or claims.get("preferred_username") or claims.get("sub"))
     room = await rooms().get(room_id)
     return authorize(room, orcid, dev_mode=bool(claims.get("em_dev_mode")))
+
+
+# ── IIIF · the authorisation the image server does not have ───────────────────
+#
+# Cantaloupe reads MinIO by sha256 and em-server is NOT in the path of a pixel.
+# Taking the canvas out of the manifest withholds the digest — which is real,
+# because the manifest is where a digest comes from — but somebody who already
+# has the hex reaches the image directly. That is the hole this closes.
+#
+# The shape: the proxy in front of the image server asks em-server first
+# (`forward_auth`), for every `/iiif/*` request. em-server stays the authority —
+# it is the process that can read the graph, resolve the room's ACL and apply
+# exactly the rule the asset route applies. Cantaloupe keeps knowing nothing
+# about rights, which is right: an image server should serve images.
+#
+# The alternative was a Cantaloupe DELEGATE script (Ruby, calling back here).
+# Rejected for two reasons: it puts a second implementation of the rule in a
+# second language inside a component whose job is not authorisation, and it is
+# invisible to anybody reading the routing — the place people look when they ask
+# "who can reach this". `forward_auth` is one stanza in the file that already
+# decides what reaches what.
+
+@v1_public.get("/iiif-authz", tags=["iiif"], responses={
+    200: {"description": "let it through"},
+    403: {"description": "under embargo for this caller"},
+    503: {"description": "the rights cannot be read right now"},
+})
+async def iiif_authz(request: Request, response: Response,
+                     token: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """May the caller of THIS image request have it? For a proxy to ask.
+
+    Answers about the request the proxy is holding, which it hands over in the
+    headers it copies (`X-Forwarded-Uri` / `X-Original-Uri`): the IIIF
+    identifier is the bare sha256, so the digest is in the path. No body, no
+    guessing — the same digest the asset route would be asked for.
+
+    **The same rule as `get_asset`, from the same code.** While an embargo runs
+    the image is for editor and above; everybody else gets 403. Two rules for
+    one question would be one rule and one bug.
+
+    Unauthenticated by design: it is a question about somebody ELSE's request,
+    and the answer for a caller with no token is exactly the answer a caller
+    with no token should get.
+    """
+    digest = _digest_from_iiif_path(
+        request.headers.get("x-forwarded-uri")
+        or request.headers.get("x-original-uri")
+        or request.query_params.get("uri") or "")
+    if not digest:
+        # Nothing that looks like a digest: this is not an image request we can
+        # judge (`info.json` of something else, a static asset). Letting it
+        # through is correct — the gate exists for images, and refusing what it
+        # cannot read would break the image server for everything else.
+        response.headers["X-EM-Authz"] = "not-an-image-request"
+        return {"ok": True, "reason": "no digest in the request"}
+
+    # The SAME walk the asset route uses, and deliberately the same function:
+    # two implementations of "may this person see this picture" would be one
+    # rule and one bug, and the bug would be the one nobody tested.
+    room_id = (request.query_params.get("room")
+               or request.headers.get("x-em-room") or "").strip()
+    if room_id:
+        await _rights_seen_anywhere(room_id, digest, request)
+        checked = 1
+    else:
+        rooms_to_ask = _rooms_holding(digest)
+        checked = len(rooms_to_ask)
+        for candidate in rooms_to_ask:
+            await _rights_seen_anywhere(candidate, digest, request)
+    response.headers["X-EM-Authz"] = "ok"
+    return {"ok": True, "digest": digest, "rooms_checked": checked}
+
+
+def _digest_from_iiif_path(path: str) -> Optional[str]:
+    """The sha256 out of a IIIF URL, or None.
+
+    `/iiif/3/<identifier>/full/max/0/default.jpg` — and the identifier is the
+    bare hex, because that is what Cantaloupe uses as the object key (measured,
+    the night the `sha256%3A` form 404'd). Anything else in that position is not
+    ours to judge.
+    """
+    import re
+    import urllib.parse
+
+    for part in urllib.parse.unquote(path).split("/"):
+        candidate = part.rsplit(":", 1)[-1]
+        if re.fullmatch(r"[0-9a-f]{64}", candidate.lower()):
+            return candidate.lower()
+    return None
+
+
+def _rooms_holding(digest: str) -> List[str]:
+    """Which rooms might have something to say about this digest.
+
+    A IIIF request carries no room — the identifier is the content itself — so
+    the question is asked of every room this instance holds. That is honest for
+    a single-instance deployment and it is stated as a limit for a sharded one:
+    a room owned by another replica cannot be consulted from here, and the
+    remedy is the `?room=` the proxy can be told to pass.
+
+    Live rooms first, then whatever the store has: a room that is open is a room
+    somebody is working in, and its document is the most recent.
+    """
+    live = rooms().rooms()
+    store = snapshot_store()
+    stored = []
+    try:
+        stored = [r for r in (store.rooms() if hasattr(store, "rooms") else [])
+                  if r not in live]
+    except Exception:  # pragma: no cover — a store that cannot list is not fatal
+        stored = []
+    return list(live) + stored
 
 
 # ── IIIF: the manifest of a room's image or document ──────────────────────────

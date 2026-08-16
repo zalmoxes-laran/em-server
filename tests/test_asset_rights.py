@@ -17,7 +17,11 @@ What these tests defend:
 * the **licence travels with the bytes**, including the default, because a
   reader who has downloaded a file has been told what they may do with it;
 * an embargoed image is **left out of the IIIF manifest**, which is what actually
-  withholds it: the manifest is where a digest comes from.
+  withholds it: the manifest is where a digest comes from;
+* the gate **fails closed**: a document that will not read answers 503, never
+  the bytes — "I cannot check" is not "there was nothing to check";
+* and it cannot be walked around by naming **another room**, because the asset
+  store is shared and the same picture can be cited in several studies.
 """
 
 from __future__ import annotations
@@ -212,3 +216,90 @@ def test_a_manifest_carries_the_licence_of_what_it_does_show(client, room,
     assert len(manifest["items"]) == 1, "the embargo has expired: the image shows"
     assert manifest["requiredStatement"]["value"]["none"] == ["CC-BY-4.0"]
     assert manifest["em:authors"] == [ANNA]
+
+
+# ── fail-closed, and the room-shopping hole ──────────────────────────────────
+
+def test_a_document_that_will_not_read_answers_503_and_not_the_bytes(
+        client, room, whoever, monkeypatch):
+    """The one that matters. Whether an asset is embargoed is UNKNOWABLE without
+    the graph, so "I cannot read the graph" must not be allowed to answer the
+    question. It used to: any failure came back as "nothing said", which served
+    the file — so a corrupt document, or a store down for a minute, published
+    every embargoed asset in the room."""
+    from app import ws as ws_mod
+
+    class Broken:
+        def get(self, room_id):
+            raise ValueError("this snapshot is not JSON")
+
+        def put(self, room_id, document):
+            pass
+
+    monkeypatch.setattr(ws_mod, "ROOMS", RoomRegistry(Broken()))
+    whoever(ANNA)                       # even the OWNER does not get bytes
+    answer = client.get(f"/v1/rooms/scavo/asset/{room['embargoed']}", headers=HEAD)
+    assert answer.status_code == 503
+    assert "unreadable" in answer.json()["detail"] or \
+        "will not read" in answer.json()["detail"]
+    assert PIXELS not in answer.content
+
+
+def test_a_room_nobody_ever_wrote_is_not_a_room_that_cannot_be_read(client, room,
+                                                                    whoever):
+    """Case (i), not case (iii): a room with no document has nowhere for an
+    embargo to hide, and the asset store is shared rather than partitioned by
+    room. `smoke.py` uploads to a room it never opens — that path must keep
+    working, and 404-ing it would protect nothing."""
+    whoever(ANNA)
+    answer = client.get(f"/v1/rooms/stanza-mai-aperta/asset/{room['plain']}",
+                        headers=HEAD)
+    assert answer.status_code == 200 and answer.content == FREE
+
+
+def test_the_embargo_cannot_be_walked_around_by_naming_another_room(client, room,
+                                                                    whoever):
+    """Measured live before it was closed: the same digest asked for through a
+    different room came back 200. A gate you get past by typing another room
+    name is not a gate."""
+    whoever(BRUNO)                      # viewer in `scavo`, nothing elsewhere
+    through_another = client.get(
+        f"/v1/rooms/qualche-altra-stanza/asset/{room['embargoed']}", headers=HEAD)
+    assert through_another.status_code == 403
+    assert "embargo" in through_another.json()["detail"]
+
+
+# ── the IIIF gate: 403 even to somebody holding the digest ───────────────────
+
+def test_the_iiif_gate_refuses_an_embargoed_image_to_a_stranger(client, room,
+                                                                whoever):
+    """Cantaloupe reads the bucket by sha256 and em-server is not in the path of
+    a pixel, so the proxy asks this before serving one. Same rule, same code as
+    the asset route."""
+    digest = room["embargoed"].split(":")[-1]
+    whoever(BRUNO)
+    refused = client.get("/v1/iiif-authz", headers={
+        **HEAD, "X-Forwarded-Uri": f"/iiif/3/{digest}/full/max/0/default.jpg"})
+    assert refused.status_code == 403
+    assert "embargo" in refused.json()["detail"]
+
+    whoever(CARLA)                      # editor
+    assert client.get("/v1/iiif-authz", headers={
+        **HEAD, "X-Forwarded-Uri": f"/iiif/3/{digest}/info.json"}
+    ).status_code == 200
+
+
+def test_the_iiif_gate_lets_through_what_it_has_no_business_judging(client, room,
+                                                                    whoever):
+    """A request with no digest in it is not an image request this can judge —
+    and refusing what it cannot read would break the image server for
+    everything else."""
+    whoever(BRUNO)
+    answer = client.get("/v1/iiif-authz",
+                        headers={**HEAD, "X-Forwarded-Uri": "/iiif/3/qualcosa/info.json"})
+    assert answer.status_code == 200
+    assert answer.json()["reason"] == "no digest in the request"
+    # …and an image nobody embargoed passes too
+    plain = room["plain"].split(":")[-1]
+    assert client.get("/v1/iiif-authz", headers={
+        **HEAD, "X-Forwarded-Uri": f"/iiif/3/{plain}/info.json"}).status_code == 200

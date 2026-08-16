@@ -39,7 +39,29 @@
 	# The IIIF Image API. `handle` and NOT `handle_path`: the API version lives
 	# in the path (`/iiif/3/...`), so stripping the prefix would take the
 	# endpoint with it.
+	#
+	# EMBARGO · every image request is authorised by em-server FIRST.
+	#
+	# Cantaloupe reads the bucket by sha256 and em-server is not in the path of
+	# a pixel: taking the canvas out of a manifest withholds the digest, but
+	# whoever already has the hex reaches the image directly. So the proxy asks
+	# — `forward_auth` to `/v1/iiif-authz`, which reads the graph, resolves the
+	# room's roles and applies the SAME rule the asset route applies (editor and
+	# above may see an embargoed image; nobody else may).
+	#
+	# `X-Forwarded-Uri` is what carries the identifier: the sub-request goes to
+	# a fixed path, so the original one has to travel in a header. `copy_headers
+	# X-EM-Authz` brings the decision back for anybody debugging it.
+	#
+	# Chosen over a Cantaloupe DELEGATE script (Ruby, calling back here): a
+	# delegate puts a second implementation of the rule in a second language,
+	# inside a component whose job is not authorisation, and hides it from the
+	# file people actually read when they ask who can reach what.
 	handle /iiif/* {
+		forward_auth em-server:8000 {
+			uri /v1/iiif-authz
+			copy_headers X-EM-Authz
+		}
 		reverse_proxy cantaloupe:8182
 	}
 
