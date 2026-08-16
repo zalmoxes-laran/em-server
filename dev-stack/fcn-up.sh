@@ -3,17 +3,32 @@
 # pubblici a quell'indirizzo (così un ALTRO computer non viene rimandato a sé stesso),
 # e tira su l'intera stack StratiGraph dietro Caddy+https.
 #
-#   ./fcn-up.sh                 # usa l'IP LAN rilevato
-#   ./fcn-up.sh strati.local    # forza un hostname (se ne hai uno risolvibile)
+#   ./fcn-up.sh                 # IP LAN rilevato, s3Dgraphy dal pin PyPI
+#   ./fcn-up.sh strati.local    # forza un hostname
+#   ./fcn-up.sh --local-s3d     # s3Dgraphy dal CHECKOUT LOCALE (editi e testi live)
+#   ./fcn-up.sh strati.local --local-s3d
 #
 # NON è magia di rete: se i due computer non si vedono (hotspot che isola i client),
 # nessuna configurazione della stack lo aggira — vedi i promemoria alla fine.
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} /^[[:space:]]*$/{next} {exit}' "$0"; exit 0
+fi
 set -euo pipefail
 cd "$(dirname "$0")"                     # em-server/dev-stack
 
 HTTPS_PORT="${HTTPS_PORT:-8443}"
 KEYCLOAK_PORT="${KEYCLOAK_PORT:-8085}"
 DEV_REALM="${DEV_REALM:-em-dev}"
+
+# ── argomenti: un hostname posizionale (opz.) + --local-s3d (opz.) ───────────
+LOCAL_S3D="no"; ARG_HOST=""
+for a in "$@"; do
+  case "$a" in
+    --local-s3d) LOCAL_S3D="yes" ;;
+    -*) echo "flag sconosciuto: $a (usa --local-s3d)"; exit 2 ;;
+    *) ARG_HOST="$a" ;;
+  esac
+done
 
 # ── 1 · Colima su ────────────────────────────────────────────────────────────
 if ! colima status >/dev/null 2>&1; then
@@ -25,16 +40,13 @@ fi
 docker context use colima >/dev/null 2>&1 || true
 
 # ── 2 · l'indirizzo dell'FCN sulla rete attuale ──────────────────────────────
-# Preferisci l'IP della VM Colima (raggiungibile in LAN con --network-address);
-# se non c'è, ripiega sull'IP LAN del Mac (che con Colima spesso NON basta).
 COLIMA_IP="$(colima ls -j 2>/dev/null | sed -n 's/.*"address":"\([0-9.]*\)".*/\1/p' | head -1 || true)"
 IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
 LAN_IP="$(ipconfig getifaddr "${IFACE:-en0}" 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
-FCN_HOST="${1:-${COLIMA_IP:-$LAN_IP}}"
+FCN_HOST="${ARG_HOST:-${COLIMA_IP:-$LAN_IP}}"
 if [ -z "$FCN_HOST" ]; then echo "✗ non trovo un indirizzo di rete. Sei online?"; exit 1; fi
 
 # ── 3 · gli URL PUBBLICI puntano all'FCN, non a localhost ────────────────────
-# (gli indirizzi INTERNI restano nomi-servizio della rete docker: non si toccano)
 export EM_DEV_DOMAIN="$FCN_HOST"
 export EM_IIIF_PUBLIC="https://${FCN_HOST}:${HTTPS_PORT}/iiif"
 export EM_CATALOG_EMSTUDIO_URL="https://${FCN_HOST}:${HTTPS_PORT}"
@@ -44,13 +56,18 @@ export EM_CATALOG_EMSTUDIO_URL="https://${FCN_HOST}:${HTTPS_PORT}"
 export OIDC_ISSUER="https://${FCN_HOST}:${HTTPS_PORT}/auth/realms/${DEV_REALM}"
 # export OIDC_ISSUER="http://${FCN_HOST}:${KEYCLOAK_PORT}/realms/${DEV_REALM}"
 
-# ── 4 · su, profilo https ────────────────────────────────────────────────────
-docker-compose --env-file .env.dev -f docker-compose.dev.yml --profile https up -d --build
+# ── 4 · su (con l'override s3Dgraphy-locale se richiesto) ─────────────────────
+COMPOSE=(docker-compose --env-file .env.dev -f docker-compose.dev.yml)
+if [ "$LOCAL_S3D" = "yes" ]; then
+  COMPOSE+=(-f docker-compose.local-s3d.yml)
+  echo "▶ modo s3Dgraphy LOCALE: em-server/em-catalog useranno ../../s3Dgraphy/src (edita e riavvia per testare)."
+fi
+"${COMPOSE[@]}" --profile https up -d --build
 
 # ── 5 · l'indirizzo per l'altro computer + i promemoria onesti ───────────────
 cat <<EOF
 
-✔ FCN acceso.
+✔ FCN acceso${LOCAL_S3D:+ (s3Dgraphy locale)}.
   Su questo computer:   https://em.localhost:${HTTPS_PORT}
   Per l'ALTRO computer: https://${FCN_HOST}:${HTTPS_PORT}
 
@@ -60,8 +77,8 @@ Perché l'altro computer arrivi (tre ostacoli, in ordine):
      se non risponde → travel-router · Condivisione Internet di macOS via cavo · Tailscale.
   2) se il ping arriva ma la pagina no: Colima. Assicurati di aver avviato con
      'colima start --network-address' (questo script lo fa al primo avvio).
-  3) fidati della CA di Caddy sull'altro computer, o il browser rifiuta il certificato
-     (la CA vive nel volume caddy_data; il comando di trust è nel README-DEV).
+  3) fidati della CA di Caddy sull'altro computer, o il browser rifiuta il certificato.
 
-Giù:  docker-compose -f docker-compose.dev.yml --profile https down   (aggiungi -v per azzerare i dati)
+$( [ "$LOCAL_S3D" = "yes" ] && echo "Dopo aver editato s3Dgraphy:  docker-compose -f docker-compose.dev.yml -f docker-compose.local-s3d.yml restart em-server em-catalog" )
+Giù:  ./fcn-down.sh   (o --stop / --wipe / --colima)
 EOF

@@ -1,0 +1,27 @@
+# Override — em-server & em-catalog girano contro il s3Dgraphy LOCALE (il checkout),
+# non contro il wheel di PyPI. Monta `s3Dgraphy/src` e lo antepone via PYTHONPATH:
+# editi s3Dgraphy sul tuo disco → riavvii il servizio → è live. Nessuna pubblicazione
+# su PyPI, nessun rebuild dell'immagine per una modifica al codice.
+#
+# Le dipendenze [geo,rdf] (pyproj, rdflib…) restano quelle già installate nell'immagine
+# dal pin PyPI: qui si sovrascrive solo il CODICE, non le dipendenze. Se editando
+# s3Dgraphy AGGIUNGI una dipendenza nuova, allora ricostruisci l'immagine.
+#
+# Uso:
+#   ./fcn-up.sh --local-s3d
+#   # equivale a:
+#   docker-compose -f docker-compose.dev.yml -f docker-compose.local-s3d.yml --profile https up -d --build
+#
+# Dopo aver editato s3Dgraphy, per raccogliere le modifiche:
+#   docker-compose -f docker-compose.dev.yml -f docker-compose.local-s3d.yml restart em-server em-catalog
+services:
+  em-server:
+    volumes:
+      - ../../s3Dgraphy/src:/s3dgraphy-src:ro
+    environment:
+      PYTHONPATH: /s3dgraphy-src        # antepone il sorgente locale a quello installato
+  em-catalog:
+    volumes:
+      - ../../s3Dgraphy/src:/s3dgraphy-src:ro
+    environment:
+      PYTHONPATH: /s3dgraphy-src
