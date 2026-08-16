@@ -40,6 +40,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -89,6 +90,34 @@ app = FastAPI(
     version=__version__,
     summary="The s3Dgraphy access API over HTTP — read-only (P0), under /v1.",
     description=__doc__,
+)
+
+# ── who may call this from a browser ─────────────────────────────────────────
+#
+# Until now nothing did, and it showed: EMStudio talks to a room over a
+# WebSocket (not subject to CORS) and everything worked — until the first
+# ordinary HTTP call from the app. A `PUT` with an `Authorization` header is a
+# preflighted request, and with no CORS policy the browser refuses it before
+# em-server ever sees it. The symptom is a bare "Failed to fetch", which reads
+# like the server is down.
+#
+# `*` by default, and it is not laxity: **there are no cookies here**. Every
+# route is opened by a bearer token the caller attaches deliberately, so a page
+# that has no token gets exactly what an anonymous caller gets, whatever its
+# origin. `allow_credentials` stays False for the same reason — turning it on is
+# what would make `*` dangerous, and nothing here needs it.
+#
+# `EM_CORS_ORIGINS` (comma-separated) narrows it for a deployment that wants to.
+_CORS = [o.strip() for o in (os.environ.get("EM_CORS_ORIGINS") or "*").split(",")
+         if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS,
+    allow_credentials=False,
+    allow_methods=["GET", "PUT", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["ETag", "X-EM-License", "X-EM-License-Default",
+                    "X-EM-Embargo", "X-EM-Author", "X-EM-Authz"],
 )
 
 #: Every endpoint hangs off this router, so the prefix is declared once and cannot
