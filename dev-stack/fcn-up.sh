@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# fcn-up — accendi il Field Computing Node: rileva l'indirizzo di rete, punta gli URL
-# pubblici a quell'indirizzo (così un ALTRO computer non viene rimandato a sé stesso),
-# e tira su l'intera stack StratiGraph dietro Caddy+https.
+# fcn-up — accendi il Field Computing Node: Caddy+https su hostname (mai IP nudo),
+# e tira su l'intera stack StratiGraph.
 #
-#   ./fcn-up.sh                 # IP LAN rilevato, s3Dgraphy dal pin PyPI
-#   ./fcn-up.sh strati.local    # forza un hostname
+#   ./fcn-up.sh                 # locale: https://em.localhost:8443 (+ serve anche il nome Bonjour .local)
+#   ./fcn-up.sh mac.local       # host PRIMARIO = un hostname risolvibile (per l'altro computer)
 #   ./fcn-up.sh --local-s3d     # s3Dgraphy dal CHECKOUT LOCALE (editi e testi live)
-#   ./fcn-up.sh strati.local --local-s3d
+#   ./fcn-up.sh mac.local --local-s3d
 #
-# NON è magia di rete: se i due computer non si vedono (hotspot che isola i client),
-# nessuna configurazione della stack lo aggira — vedi i promemoria alla fine.
+# NB: la CA interna di Caddy NON fa certificati per un IP nudo → per l'altro computer
+# serve un HOSTNAME (il nome Bonjour `<mac>.local`, o /etc/hosts, o un dominio vero),
+# non 172.x.x.x. E la rete deve vedersi (hotspot che isola i client → travel-router/Tailscale).
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} /^[[:space:]]*$/{next} {exit}' "$0"; exit 0
 fi
@@ -17,10 +17,9 @@ set -euo pipefail
 cd "$(dirname "$0")"                     # em-server/dev-stack
 
 HTTPS_PORT="${HTTPS_PORT:-8443}"
-KEYCLOAK_PORT="${KEYCLOAK_PORT:-8085}"
 DEV_REALM="${DEV_REALM:-em-dev}"
 
-# ── argomenti: un hostname posizionale (opz.) + --local-s3d (opz.) ───────────
+# ── argomenti: hostname PRIMARIO opzionale + --local-s3d ─────────────────────
 LOCAL_S3D="no"; ARG_HOST=""
 for a in "$@"; do
   case "$a" in
@@ -33,28 +32,25 @@ done
 # ── 1 · Colima su ────────────────────────────────────────────────────────────
 if ! colima status >/dev/null 2>&1; then
   echo "▶ avvio Colima…"
-  # --network-address dà alla VM un IP raggiungibile in LAN: è ciò che serve
-  # perché un altro computer arrivi alle porte (senza, Colima lega a 127.0.0.1).
   colima start --cpu 4 --memory 8 --network-address
 fi
 docker context use colima >/dev/null 2>&1 || true
 
-# ── 2 · l'indirizzo dell'FCN sulla rete attuale ──────────────────────────────
-COLIMA_IP="$(colima ls -j 2>/dev/null | sed -n 's/.*"address":"\([0-9.]*\)".*/\1/p' | head -1 || true)"
-IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
-LAN_IP="$(ipconfig getifaddr "${IFACE:-en0}" 2>/dev/null || ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
-FCN_HOST="${ARG_HOST:-${COLIMA_IP:-$LAN_IP}}"
-if [ -z "$FCN_HOST" ]; then echo "✗ non trovo un indirizzo di rete. Sei online?"; exit 1; fi
+# ── 2 · host primario (browser) + gli indirizzi che Caddy serve ──────────────
+PRIMARY="${ARG_HOST:-em.localhost}"                 # dove punta il browser (URL pubblici)
+BONJOUR="$(scutil --get LocalHostName 2>/dev/null || true)"; [ -n "$BONJOUR" ] && BONJOUR="${BONJOUR}.local"
+# Caddy serve em.localhost SEMPRE, + il primario e il nome Bonjour se diversi (hostname, mai IP)
+addrs="https://em.localhost"
+[ "$PRIMARY" != "em.localhost" ] && addrs="$addrs, https://$PRIMARY"
+[ -n "$BONJOUR" ] && [ "$BONJOUR" != "em.localhost" ] && [ "$BONJOUR" != "$PRIMARY" ] && addrs="$addrs, https://$BONJOUR"
+export EM_SITE="$addrs"
+export EM_DEV_DOMAIN="$PRIMARY"
 
-# ── 3 · gli URL PUBBLICI puntano all'FCN, non a localhost ────────────────────
-export EM_DEV_DOMAIN="$FCN_HOST"
-export EM_IIIF_PUBLIC="https://${FCN_HOST}:${HTTPS_PORT}/iiif"
-export EM_CATALOG_EMSTUDIO_URL="https://${FCN_HOST}:${HTTPS_PORT}"
-# ⚠ VERIFICA: l'issuer OIDC dipende da come Caddy espone Keycloak nel tuo
-# Caddyfile.dev. Se Keycloak è dietro Caddy (es. rotta /auth) usa la prima riga;
-# se è esposto sulla sua porta diretta, usa la seconda. Controlla Caddyfile.dev.
-export OIDC_ISSUER="https://${FCN_HOST}:${HTTPS_PORT}/auth/realms/${DEV_REALM}"
-# export OIDC_ISSUER="http://${FCN_HOST}:${KEYCLOAK_PORT}/realms/${DEV_REALM}"
+# ── 3 · gli URL PUBBLICI puntano all'host primario ───────────────────────────
+export EM_IIIF_PUBLIC="https://${PRIMARY}:${HTTPS_PORT}/iiif"
+export EM_CATALOG_EMSTUDIO_URL="https://${PRIMARY}:${HTTPS_PORT}"
+# ⚠ VERIFICA: l'issuer OIDC dipende da come Caddy espone Keycloak nel Caddyfile.dev
+export OIDC_ISSUER="https://${PRIMARY}:${HTTPS_PORT}/auth/realms/${DEV_REALM}"
 
 # ── 4 · su (con l'override s3Dgraphy-locale se richiesto) ─────────────────────
 COMPOSE=(docker-compose --env-file .env.dev -f docker-compose.dev.yml)
@@ -64,21 +60,19 @@ if [ "$LOCAL_S3D" = "yes" ]; then
 fi
 "${COMPOSE[@]}" --profile https up -d --build
 
-# ── 5 · l'indirizzo per l'altro computer + i promemoria onesti ───────────────
+# ── 5 · indirizzi + promemoria ───────────────────────────────────────────────
 cat <<EOF
 
-✔ FCN acceso${LOCAL_S3D:+ (s3Dgraphy locale)}.
-  Su questo computer:   https://em.localhost:${HTTPS_PORT}
-  Per l'ALTRO computer: https://${FCN_HOST}:${HTTPS_PORT}
+✔ FCN acceso${LOCAL_S3D:+ (s3Dgraphy locale)}. Caddy serve: ${EM_SITE}
+  Su questo computer:   https://${PRIMARY}:${HTTPS_PORT}/em/v1/health
+$( [ -n "$BONJOUR" ] && [ "$BONJOUR" != "$PRIMARY" ] && echo "  Per l'ALTRO computer: https://${BONJOUR}:${HTTPS_PORT}/em/v1/health   (via Bonjour/mDNS)" )
 
-Perché l'altro computer arrivi (tre ostacoli, in ordine):
-  1) DEVONO VEDERSI IN RETE. L'hotspot del telefono spesso isola i client.
-     Prova dall'altro:   ping ${FCN_HOST}
-     se non risponde → travel-router · Condivisione Internet di macOS via cavo · Tailscale.
-  2) se il ping arriva ma la pagina no: Colima. Assicurati di aver avviato con
-     'colima start --network-address' (questo script lo fa al primo avvio).
-  3) fidati della CA di Caddy sull'altro computer, o il browser rifiuta il certificato.
-
-$( [ "$LOCAL_S3D" = "yes" ] && echo "Dopo aver editato s3Dgraphy:  docker-compose -f docker-compose.dev.yml -f docker-compose.local-s3d.yml restart em-server em-catalog" )
+Note:
+  · la ROOT (/) è vuota: apri un percorso vero — /em/v1/health , /catalog/ , /iiif/…
+  · certificato: se il browser lo rifiuta → ./fcn-trust-ca.sh (una volta; e dopo ogni --wipe).
+  · altro computer: serve un HOSTNAME (mai IP nudo, rompe il TLS della CA interna) e che le
+    due macchine si vedano in rete (hotspot che isola → travel-router · Internet-Sharing · Tailscale).
+    Per usarlo come primario:  ./fcn-up.sh ${BONJOUR:-<mac>.local}
+$( [ "$LOCAL_S3D" = "yes" ] && echo "  · dopo aver editato s3Dgraphy:  docker-compose -f docker-compose.dev.yml -f docker-compose.local-s3d.yml restart em-server em-catalog" )
 Giù:  ./fcn-down.sh   (o --stop / --wipe / --colima)
 EOF

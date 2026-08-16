@@ -18,7 +18,7 @@
 	auto_https disable_redirects
 }
 
-https://{$EM_DEV_DOMAIN:em.localhost} {
+{$EM_SITE:https://em.localhost} {
 	tls internal
 
 	# StratiGraph · the room (graph + assets + the WebSocket the editors join).
