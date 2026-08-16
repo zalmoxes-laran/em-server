@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
@@ -103,6 +104,20 @@ class Room:
         #: lazily read, see the `embargo` property. `_UNREAD` and not None
         #: because "no embargo" is an answer worth remembering too.
         self._embargo: Any = _UNREAD
+        #: Bumped on every write to this room's document. The digest index
+        #: (`app/digest_index.py`) watches it, and that is the whole design: an
+        #: index that expired on a TIMER would be a *cache of an embargo*, and an
+        #: embargo read from a cache is precisely what the asset gate promises
+        #: not to do. A revision is not a clock — it changes when the document
+        #: changes, which is the only moment the answer can.
+        self.revision: int = 0
+        #: …and WHICH working copy this is. A room dropped and rebuilt (a
+        #: `forget`, a fresh registry, a snapshot restored) is a different
+        #: document with the same name and a revision that starts again at zero:
+        #: without this, a derived index keyed on (room_id, revision) would hand
+        #: the new room the old room's answers. Measured — two tests, same room
+        #: id, different embargo, and the second read the first's.
+        self.instance: str = uuid.uuid4().hex[:12]
 
     # ── who may read this study ──────────────────────────────────────────────
 
@@ -195,6 +210,10 @@ class Room:
 
     # ── the operations (the library does the work) ───────────────────────────
 
+    def touch(self) -> None:
+        """The document changed. Say so, once, where everything derived can see."""
+        self.revision += 1
+
     def apply(self, op: Dict[str, Any], graph_id: Optional[str] = None) -> Dict[str, Any]:
         """Apply ONE operation to the working copy, through s3Dgraphy.
 
@@ -206,7 +225,10 @@ class Room:
         section = self._section(graph_id)
         if section is None:
             return {"applied": False, "reason": "no such graph in this room"}
-        return em.apply_op(section, op)
+        result = em.apply_op(section, op)
+        if result.get("applied"):
+            self.touch()
+        return result
 
     def _section(self, graph_id: Optional[str]) -> Optional[Dict[str, Any]]:
         graphs = self.document.get("graphs") or {}

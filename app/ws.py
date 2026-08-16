@@ -35,7 +35,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from . import access
-from .access import Acl, Role, acl_store_from_env
+from .access import (Acl, Groups, Role, acl_store_from_env,
+                     group_store_from_env)
 from .auth import authenticator
 from .rooms import RoomRegistry, now_iso
 from .store import store_from_env
@@ -51,6 +52,17 @@ ROOMS = RoomRegistry(SNAPSHOT_STORE)
 #: ACL inside the em.json would ship an access-control list with the record of
 #: what was found (see `access.py`).
 ACL_STORE = acl_store_from_env()
+
+#: …and the registry of WHO IS IN WHICH GROUP. Separate from the ACLs because it
+#: is instance-wide: a group is a set of people, and the rooms grant roles to the
+#: name rather than to six ORCIDs each.
+GROUP_STORE = group_store_from_env()
+
+
+def groups() -> Groups:
+    """The group registry, resolved when asked (see `main.rooms()` for why the
+    import-time binding is a trap this codebase has already fallen into)."""
+    return Groups(GROUP_STORE)
 
 #: The wire version lives in `wire.py` now — one definition for every speaker in
 #: this process, so a bump cannot be half-applied.
@@ -133,7 +145,10 @@ def authorize(room, author: Optional[str], *, dev_mode: bool = False
             if access.claim_owner(room.document, author):
                 acl.owner = access.owner_from_document(room.document)
                 save_acl(room.room_id, acl)
-    return access.role_of(acl, author, room.visibility, embargo=room.embargo)
+    # …and the group grants are expanded here: `role_of` takes the maximum of
+    # the individual grant and whatever the person's groups hold.
+    return access.role_of(acl, author, room.visibility, embargo=room.embargo,
+                          groups_of=groups().expander())
 
 
 async def _deny(websocket: WebSocket, member, verb: str, reason: str) -> None:

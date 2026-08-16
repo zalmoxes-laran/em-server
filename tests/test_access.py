@@ -153,9 +153,9 @@ def test_an_orcid_is_the_same_person_written_as_a_url():
 
 
 def test_a_group_grant_expands_through_the_seam_and_the_strongest_wins():
-    """Groups are not built yet; the shape that will hold them is, and this is
-    what keeps it honest — the day a registry exists, the resolver does not
-    change."""
+    """The resolver, on its own: handed an expander it takes the STRONGEST
+    grant. The registry that provides that expander is tested further down; here
+    the point is that the resolution is a pure function of what it is given."""
     acl = Acl(owner=ANNA, groups={"scavo-2026": "editor", "ospiti": "viewer"})
     assert role_of(acl, BRUNO, "restricted") is None, "no expander: no grant"
     assert role_of(acl, BRUNO, "restricted",
@@ -379,3 +379,108 @@ def test_an_unknown_role_is_a_400_not_a_silent_viewer(client, enforcing):
     answer = client.put(f"/v1/rooms/scavo/members/{CARLA}", json={"role": "boss"},
                         headers={"Authorization": "Bearer t"})
     assert answer.status_code == 400 and "expected viewer" in answer.json()["detail"]
+
+
+# ── groups: a name for a set of people, above the per-ORCID ACL ──────────────
+
+def test_a_group_grant_and_an_individual_one_resolve_to_the_MAXIMUM(client,
+                                                                    enforcing,
+                                                                    relay,
+                                                                    monkeypatch):
+    """The rule that makes groups safe to add: the strongest grant wins.
+
+    If the individual grant always won, adding somebody to the excavation team
+    would silently DEMOTE them — a viewer grant from last month would keep
+    beating the editor role the team has now."""
+    from app import ws as ws_mod
+    from app.access import Group, Groups, InMemoryGroupStore
+
+    store = InMemoryGroupStore()
+    monkeypatch.setattr(ws_mod, "GROUP_STORE", store)
+    Groups(store).put(Group("scavo-2026", "Scavo 2026", [BRUNO, CARLA]))
+
+    # the room grants EDITOR to the group, and viewer to Bruno personally
+    relay.put("scavo", Acl(owner=ANNA, members={BRUNO: "viewer"},
+                           groups={"scavo-2026": "editor"}).as_dict())
+
+    enforcing(BRUNO)
+    with client.websocket_connect("/v1/rooms/scavo/ws?token=t") as b:
+        host = _join(b)
+        assert host["role"] == "editor", "the group's grant beats the weaker one"
+        assert host["can_write"] is True
+
+    enforcing(CARLA)                    # only in the group
+    with client.websocket_connect("/v1/rooms/scavo/ws?token=t") as c:
+        assert _join(c)["role"] == "editor"
+
+
+def test_leaving_the_group_takes_the_role_with_it(client, enforcing, relay,
+                                                  monkeypatch):
+    from app import ws as ws_mod
+    from app.access import Group, Groups, InMemoryGroupStore
+
+    store = InMemoryGroupStore()
+    monkeypatch.setattr(ws_mod, "GROUP_STORE", store)
+    registry = Groups(store)
+    registry.put(Group("scavo-2026", "Scavo 2026", [BRUNO, CARLA]))
+    relay.put("scavo", Acl(owner=ANNA, groups={"scavo-2026": "editor"}).as_dict())
+
+    enforcing(CARLA)
+    with client.websocket_connect("/v1/rooms/scavo/ws?token=t") as c:
+        assert _join(c)["can_write"] is True
+
+    group = registry.get("scavo-2026")
+    group.remove(CARLA)
+    registry.put(group)
+    # …and the room is shut at the next door: a restricted study with no other
+    # grant leaves nothing behind
+    with pytest.raises(Exception) as refused:
+        with client.websocket_connect("/v1/rooms/scavo/ws?token=t") as c:
+            c.receive_json()
+    assert refused.value.code == 4403
+
+
+def test_the_group_registry_survives_the_process(tmp_path):
+    from app.access import DirectoryGroupStore, Group, Groups
+
+    Groups(DirectoryGroupStore(tmp_path)).put(
+        Group("scavo-2026", "Scavo 2026", [BRUNO], owner=ANNA))
+    again = Groups(DirectoryGroupStore(tmp_path)).get("scavo-2026")
+    assert again.members == [BRUNO] and again.owner == ANNA
+    assert (tmp_path / "groups.json").is_file(), "on disk, not in a memory nobody kept"
+
+
+def test_the_rest_manages_groups_and_only_the_owner_may(client, enforcing,
+                                                        monkeypatch):
+    from app import ws as ws_mod
+    from app.access import InMemoryGroupStore
+
+    monkeypatch.setattr(ws_mod, "GROUP_STORE", InMemoryGroupStore())
+    head = {"Authorization": "Bearer t"}
+
+    enforcing(ANNA)
+    made = client.put("/v1/groups/scavo-2026",
+                      json={"id": "scavo-2026", "name": "Scavo 2026",
+                            "members": [BRUNO]}, headers=head)
+    assert made.status_code == 200, made.text
+    assert made.json()["owner"] == ANNA and made.json()["members"] == [BRUNO]
+
+    added = client.put(f"/v1/groups/scavo-2026/members/{CARLA}", headers=head)
+    assert added.json()["members"] == [BRUNO, CARLA]
+    # idempotent: adding twice is one membership
+    assert client.put(f"/v1/groups/scavo-2026/members/{CARLA}",
+                      headers=head).json()["members"] == [BRUNO, CARLA]
+
+    enforcing(BRUNO)                     # a member, not the owner
+    refused = client.put(f"/v1/groups/scavo-2026/members/{ANNA}", headers=head)
+    assert refused.status_code == 403
+    assert "managed by whoever created it" in refused.json()["detail"]
+    # …but reading the list is not a secret
+    assert client.get("/v1/groups", headers=head).status_code == 200
+
+    enforcing(ANNA)
+    assert client.delete(f"/v1/groups/scavo-2026/members/{CARLA}",
+                         headers=head).json()["members"] == [BRUNO]
+    gone = client.delete("/v1/groups/scavo-2026", headers=head)
+    assert gone.status_code == 200 and gone.json()["ok"] is True
+    assert client.get("/v1/groups", headers=head).json() == []

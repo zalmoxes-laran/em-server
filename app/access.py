@@ -46,14 +46,15 @@ future the study behaves as restricted whatever its declared visibility, and
 when it passes the study goes back to what it says it is. One rule, so the
 Catalog's listing and the room's door cannot drift apart.
 
-## Groups: designed for, not built
+## Groups: built, ON TOP of the per-ORCID ACL
 
-The resolver takes ORCID → role. A named **group** of ORCIDs receiving a role is
-the obvious next step, and nothing here precludes it: the ACL document already
-carries a `groups` section that the resolver reads through an *expander* seam
-(`groups_of`), defaulting to "this deployment has no groups". Building the group
-registry is its own piece of work; leaving the hole shaped for it is this one's
-job.
+A named **group** of ORCIDs can hold a role in a room's ACL, and the registry of
+who is in which group lives here too (`Groups`). It takes nothing away from the
+foundation: a grant to a person is still a grant to a person, and the two are
+read together. The resolution is one word — **the maximum** — which is a
+comparison rather than a table of cases because the roles are ordered, and which
+is the only safe direction: if the individual grant always won, adding somebody
+to the excavation team would silently demote them.
 """
 
 from __future__ import annotations
@@ -133,10 +134,10 @@ class Acl:
             key = _norm(orcid)
             if parsed and key:
                 self.members[key] = parsed
-        #: name → role. Read by the resolver through the `groups_of` seam; no
-        #: registry of group MEMBERSHIP exists yet, so today this stays empty in
-        #: practice. It is here so the file format does not have to change when
-        #: it does not.
+        #: name → role. The MEMBERSHIP lives in the registry (`Groups`), and
+        #: the resolver reaches it through the `groups_of` seam — so a room's
+        #: ACL says "the excavation team may edit" without listing six people
+        #: who would then have to be edited in every room they work in.
         self.groups: Dict[str, Role] = {}
         for name, role in (groups or {}).items():
             parsed = parse_role(role)
@@ -408,3 +409,179 @@ def may_assign(actor: Optional[Role], target_current: Optional[Role],
     if target_current in (Role.OWNER, Role.ADMIN):
         return "an admin cannot change an owner or another admin"
     return None
+
+
+# ── groups: a named set of ORCIDs, above the per-ORCID ACL ───────────────────
+#
+# The foundation stays what it was: an ACL keyed by ORCID. Groups sit ON TOP of
+# it and take nothing away — a grant to a person is still a grant to a person,
+# and the two kinds are read together rather than one replacing the other.
+#
+# Why a registry at all: "the excavation team" is a sentence people say, and
+# writing it out as six ORCIDs in every room's ACL means six edits every time
+# somebody joins or leaves, in every room, forever. The group is the name; the
+# rooms grant to the name.
+#
+# The resolution rule is one word: **the maximum**. Somebody with an individual
+# `viewer` grant who is also in a group granted `editor` is an editor — because
+# the roles are ordered, "maximum" is a comparison rather than a table of
+# special cases, and because the alternative (individual always wins) would make
+# a group grant a trap: adding somebody to the team would silently demote them.
+
+class Group:
+    """`{id, name, members: [orcid]}` — data, with the ORCIDs normalised.
+
+    The `owner` is whoever created it: groups are managed by the person who made
+    them, the same arrangement rooms use, and for the same reason — somebody has
+    to be able to fix it, and "everybody" is not an answer.
+    """
+
+    def __init__(self, group_id: str, name: str = "",
+                 members: Optional[Iterable[str]] = None,
+                 owner: Optional[str] = None) -> None:
+        self.id = str(group_id).strip()
+        self.name = str(name or group_id).strip()
+        self.owner = _norm(owner)
+        self.members: list = []
+        for orcid in members or []:
+            key = _norm(orcid)
+            if key and key not in self.members:
+                self.members.append(key)
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "Group":
+        return cls(raw.get("id") or "", raw.get("name") or "",
+                   raw.get("members") or [], raw.get("owner"))
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "name": self.name, "owner": self.owner,
+                "members": list(self.members)}
+
+    def add(self, orcid: str) -> bool:
+        key = _norm(orcid)
+        if not key or key in self.members:
+            return False
+        self.members.append(key)
+        return True
+
+    def remove(self, orcid: str) -> bool:
+        key = _norm(orcid)
+        if not key or key not in self.members:
+            return False
+        self.members.remove(key)
+        return True
+
+    def has(self, orcid: Optional[str]) -> bool:
+        key = _norm(orcid)
+        return bool(key) and key in self.members
+
+
+class GroupStore(Protocol):
+    """Read and write the whole registry. One document, because a group list is
+    small and read on every door: a file per group would be N reads per join."""
+
+    def load(self) -> Dict[str, Any]: ...
+
+    def save(self, data: Dict[str, Any]) -> None: ...
+
+
+class InMemoryGroupStore:
+    def __init__(self) -> None:
+        self._raw = "{}"
+        self._lock = threading.Lock()
+
+    def load(self) -> Dict[str, Any]:
+        with self._lock:
+            return json.loads(self._raw)
+
+    def save(self, data: Dict[str, Any]) -> None:
+        blob = json.dumps(data, sort_keys=True, ensure_ascii=False)
+        with self._lock:
+            self._raw = blob
+
+
+class DirectoryGroupStore:
+    """`groups.json` beside the snapshots, written atomically."""
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self.root = pathlib.Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / "groups.json"
+
+    def load(self) -> Dict[str, Any]:
+        if not self.path.is_file():
+            return {}
+        # An unreadable registry RAISES rather than reading as "no groups":
+        # answering "no groups" would silently drop every grant made to one.
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def save(self, data: Dict[str, Any]) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True),
+                       encoding="utf-8")
+        tmp.replace(self.path)
+
+
+def group_store_from_env(environ: Optional[Dict[str, str]] = None) -> GroupStore:
+    env = environ if environ is not None else os.environ
+    directory = env.get("EM_ACL_DIR") or env.get("EM_SNAPSHOT_DIR")
+    if directory:
+        return DirectoryGroupStore(directory)
+    return InMemoryGroupStore()
+
+
+class Groups:
+    """The registry, as the rest of the code wants to ask it.
+
+    Reads through to the store every time. Same reasoning as the ACL: a
+    membership change must take effect at the next door, and a cache would need
+    an invalidation channel for a document read once per join.
+    """
+
+    def __init__(self, store: GroupStore) -> None:
+        self.store = store
+
+    def all(self) -> Dict[str, Group]:
+        raw = self.store.load() or {}
+        out: Dict[str, Group] = {}
+        for gid, item in (raw.get("groups") or {}).items():
+            group = Group.from_dict({**item, "id": item.get("id") or gid})
+            if group.id:
+                out[group.id] = group
+        return out
+
+    def get(self, group_id: str) -> Optional[Group]:
+        return self.all().get(str(group_id).strip())
+
+    def put(self, group: Group) -> None:
+        raw = self.store.load() or {}
+        groups = dict(raw.get("groups") or {})
+        groups[group.id] = group.as_dict()
+        raw["groups"] = groups
+        self.store.save(raw)
+
+    def drop(self, group_id: str) -> bool:
+        raw = self.store.load() or {}
+        groups = dict(raw.get("groups") or {})
+        if str(group_id) not in groups:
+            return False
+        del groups[str(group_id)]
+        raw["groups"] = groups
+        self.store.save(raw)
+        return True
+
+    def of(self, orcid: Optional[str]) -> list:
+        """Which groups this ORCID belongs to — the expander `role_of` takes."""
+        return [gid for gid, group in self.all().items() if group.has(orcid)]
+
+    def expander(self):
+        """A `groups_of` callable for :func:`role_of`. Bound to this registry so
+        the resolver stays a pure function of what it is handed."""
+        return lambda orcid: self.of(orcid)
+
+
+def describe_groups(store: GroupStore) -> str:
+    return {
+        "InMemoryGroupStore": "memory (not durable — dies with the process)",
+        "DirectoryGroupStore": "directory (beside the snapshots)",
+    }.get(type(store).__name__, type(store).__name__)

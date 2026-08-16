@@ -48,11 +48,13 @@ from fastapi import Request
 from .assets import ASSET_STORE, asset_ref_valid
 from .assets import describe as asset_describe
 from .auth import AuthDependency, authenticator
-from .access import Acl, Role, may_assign, parse_role
+from .access import Acl, Group, Role, may_assign, parse_role
 from .access import describe as acl_describe
+from .digest_index import INDEX as DIGEST_INDEX
 from .store import describe as snapshot_describe
 from . import ws as _ws
-from .ws import ACL_STORE, SNAPSHOT_STORE, authorize, load_acl, save_acl, ws_router
+from .ws import (ACL_STORE, SNAPSHOT_STORE, authorize, groups, load_acl,
+                 save_acl, ws_router)
 
 
 def rooms():
@@ -365,7 +367,31 @@ async def _asset_rights(room_id: str, ref: str) -> Optional[Dict[str, Any]]:
     exist would still serve the same bytes.
     """
     room = await rooms().get(room_id)      # may raise: the store is not here
+    known, rights = DIGEST_INDEX.rights(room_id, room, _digest_of(ref))
+    if known:
+        # …from the index, which is rebuilt the moment the room's document
+        # changes (`Room.revision`) rather than on a timer. What is cached is
+        # what the GRAPH SAYS; whether the embargo is running is computed from
+        # today's date every time it is asked, below.
+        return _fresh_verdict(rights)
     return em.asset_rights(room.document, ref)
+
+
+def _fresh_verdict(rights: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Re-decide `embargo_active` NOW, on cached facts.
+
+    The date is the one part of the answer that changes without anybody writing
+    anything: an embargo that ends tomorrow is over tomorrow, and an index that
+    stored the verdict would go on refusing the file until somebody edited the
+    graph. So the FACTS are cached and the VERDICT is not.
+    """
+    if not rights:
+        return rights
+    try:
+        from s3dgraphy.study import embargo_active
+    except ImportError:  # pragma: no cover — the library is a hard dep
+        return rights
+    return {**rights, "embargo_active": embargo_active(rights.get("embargo"))}
 
 
 async def _rights_seen_anywhere(room_id: str, ref: str,
@@ -555,7 +581,14 @@ def _rooms_holding(digest: str) -> List[str]:
                   if r not in live]
     except Exception:  # pragma: no cover — a store that cannot list is not fatal
         stored = []
-    return list(live) + stored
+    candidates = list(live) + stored
+    # …and the INDEX narrows it. Only the rooms that mention this digest are
+    # worth reading; the rest cannot have anything to say about it. A room the
+    # index has not read is kept in the list — "not read" must never pass for
+    # "says nothing", which is the difference between an index and a hole.
+    registry = rooms()
+    return DIGEST_INDEX.rooms_for(
+        digest, [(room_id, registry.peek(room_id)) for room_id in candidates])
 
 
 # ── IIIF: the manifest of a room's image or document ──────────────────────────
@@ -1030,6 +1063,126 @@ async def remove_member(room_id: str, orcid: str, request: Request) -> Members:
                    members=[MemberOut(orcid=k, role=v.value)
                             for k, v in sorted(acl.members.items())],
                    your_role=role.value)
+
+
+# ── groups: a name for a set of people ────────────────────────────────────────
+#
+# A room grants a role to a NAME ("the excavation team") instead of to six
+# ORCIDs it would then have to keep in step with reality. The registry is
+# instance-wide; the grant stays in each room's ACL, where it belongs.
+#
+# Who may manage one: **whoever made it**. The same arrangement rooms use, and
+# for the same reason — somebody has to be able to fix it, and "everybody" is
+# not an answer. There is no global administrator in this service and inventing
+# one here would be a bigger decision than a group list deserves.
+
+class GroupIn(BaseModel):
+    id: str = Field(description="short stable id, e.g. `scavo-2026`")
+    name: str = Field(default="", description="how humans read it")
+    members: List[str] = Field(default_factory=list)
+
+
+class GroupOut(BaseModel):
+    id: str
+    name: str
+    owner: Optional[str] = None
+    members: List[str] = Field(default_factory=list)
+
+
+def _caller(request: Request) -> Optional[str]:
+    principal = authenticator.require_token(request)
+    if principal.get("em_dev_mode"):
+        return None            # dev mode has no identities; see `access.py`
+    return (principal.get("orcid") or principal.get("preferred_username")
+            or principal.get("sub"))
+
+
+def _may_manage(group: Group, who: Optional[str], request: Request) -> None:
+    """The owner of a group manages it. Dev mode manages everything, because dev
+    mode has no identities to distinguish."""
+    if not authenticator.settings.enforcing:
+        return
+    if group.owner and who and group.owner == who:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"the group {group.id!r} is managed by whoever created it "
+               f"({group.owner or 'nobody recorded'})")
+
+
+@v1.get("/groups", response_model=List[GroupOut], tags=["access"])
+def list_groups(request: Request) -> List[GroupOut]:
+    """Every group this instance knows. Readable by any authenticated caller:
+    a group is a name for a team, not a secret, and you cannot be granted a role
+    through one you are not allowed to see the name of."""
+    authenticator.require_token(request)
+    return [GroupOut(**g.as_dict()) for g in sorted(groups().all().values(),
+                                                    key=lambda g: g.id)]
+
+
+@v1.put("/groups/{group_id}", response_model=GroupOut, tags=["access"])
+def put_group(group_id: str, body: GroupIn, request: Request) -> GroupOut:
+    """Create a group, or replace the one you own.
+
+    Idempotent: the same call twice leaves one group with those members. The
+    creator becomes the owner, and only they may replace it afterwards.
+    """
+    who = _caller(request)
+    registry = groups()
+    existing = registry.get(group_id)
+    if existing is not None:
+        _may_manage(existing, who, request)
+    group = Group(group_id, body.name or (existing.name if existing else group_id),
+                  body.members, owner=(existing.owner if existing else who))
+    registry.put(group)
+    return GroupOut(**group.as_dict())
+
+
+@v1.put("/groups/{group_id}/members/{orcid}", response_model=GroupOut,
+        tags=["access"])
+def add_group_member(group_id: str, orcid: str, request: Request) -> GroupOut:
+    who = _caller(request)
+    registry = groups()
+    group = registry.get(group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"no group {group_id!r}")
+    _may_manage(group, who, request)
+    group.add(orcid)
+    registry.put(group)
+    return GroupOut(**group.as_dict())
+
+
+@v1.delete("/groups/{group_id}/members/{orcid}", response_model=GroupOut,
+           tags=["access"])
+def remove_group_member(group_id: str, orcid: str, request: Request) -> GroupOut:
+    """Take somebody out. Removing who is not there is not an error — the state
+    asked for is the state that results."""
+    who = _caller(request)
+    registry = groups()
+    group = registry.get(group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"no group {group_id!r}")
+    _may_manage(group, who, request)
+    group.remove(orcid)
+    registry.put(group)
+    return GroupOut(**group.as_dict())
+
+
+@v1.delete("/groups/{group_id}", tags=["access"])
+def delete_group(group_id: str, request: Request) -> Dict[str, Any]:
+    """Drop the group. The grants that named it stay in the rooms' ACLs and stop
+    resolving — reported rather than chased: a server that walked every room to
+    scrub a name would be doing a migration nobody asked for, and the grant is
+    visible in the room's member list, where somebody can decide."""
+    who = _caller(request)
+    registry = groups()
+    group = registry.get(group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"no group {group_id!r}")
+    _may_manage(group, who, request)
+    return {"ok": registry.drop(group_id), "group": group_id,
+            "note": "grants naming this group stay in the rooms' ACLs and now "
+                    "resolve to nothing"}
 
 
 app.include_router(v1_public)

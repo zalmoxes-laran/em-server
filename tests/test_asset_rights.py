@@ -303,3 +303,62 @@ def test_the_iiif_gate_lets_through_what_it_has_no_business_judging(client, room
     plain = room["plain"].split(":")[-1]
     assert client.get("/v1/iiif-authz", headers={
         **HEAD, "X-Forwarded-Uri": f"/iiif/3/{plain}/info.json"}).status_code == 200
+
+
+# ── the digest index: fast, and never stale ──────────────────────────────────
+
+def test_the_index_answers_without_walking_every_room_but_is_never_stale(
+        client, room, whoever, monkeypatch):
+    """The hot path (a IIIF tile) asked every room's document on every request.
+    An index fixes that — and the only thing that matters about it is WHEN it is
+    invalidated: on the WRITE, never on a timer. A cache with a TTL would be a
+    cache of an embargo, which is the one thing the gate promises not to keep."""
+    from app.digest_index import INDEX
+    from app import digest_index
+
+    digest = room["embargoed"].split(":")[-1]
+    import asyncio
+    live = asyncio.run(ws_module.ROOMS.get("scavo"))
+
+    scans = {"n": 0}
+    real_scan = digest_index._scan
+    monkeypatch.setattr(digest_index, "_scan",
+                        lambda doc: (scans.__setitem__("n", scans["n"] + 1),
+                                     real_scan(doc))[1])
+
+    known, rights = INDEX.rights("scavo", live, digest)
+    assert known and rights["embargo_active"] is True
+    assert scans["n"] == 1, "the first question reads the document"
+
+    for _ in range(5):
+        INDEX.rights("scavo", live, digest)
+    assert scans["n"] == 1, "…and the next five do not: that is the whole point"
+
+    # …now the document CHANGES. No timer runs out; the revision moves, and the
+    # very next question is answered from a fresh read.
+    live.apply({"op": "remove_node", "id": "emb", "ts": "2026-08-16T12:00:00Z"})
+    known, rights = INDEX.rights("scavo", live, digest)
+    assert scans["n"] == 2, "a write invalidates immediately"
+    assert not rights or rights.get("embargo_active") is not True, \
+        "the embargo was lifted, and nothing served it stale"
+
+
+def test_the_index_does_not_hand_a_rebuilt_room_the_old_rooms_answers(room):
+    """A room dropped and rebuilt is a different working copy whose revision
+    starts again at zero. Keyed on the number alone, the index would answer the
+    new room with the old one's rights — measured, in this very suite."""
+    from app.digest_index import DigestIndex
+    from app.rooms import Room
+
+    digest = room["embargoed"].split(":")[-1]
+    index = DigestIndex()
+    first = Room("scavo", document("scavo", embargoed=room["embargoed"],
+                                   plain=room["plain"], until="2099-01-01"))
+    assert index.rights("scavo", first, digest)[1]["embargo_active"] is True
+
+    rebuilt = Room("scavo", document("scavo", embargoed=room["embargoed"],
+                                     plain=room["plain"], until="2001-01-01"))
+    assert rebuilt.revision == first.revision == 0
+    known, rights = index.rights("scavo", rebuilt, digest)
+    assert known and rights["embargo_active"] is False, \
+        "the rebuilt room's own document decides, not the id it happens to share"

@@ -252,7 +252,14 @@ def test_the_openapi_schema_is_served():
               for verb in ops if verb in ("put", "patch", "delete")}
     assert writes == {("PUT", "/v1/rooms/{room_id}/asset"),
                       ("PUT", "/v1/rooms/{room_id}/members/{orcid}"),
-                      ("DELETE", "/v1/rooms/{room_id}/members/{orcid}")}, \
+                      ("DELETE", "/v1/rooms/{room_id}/members/{orcid}"),
+                      # …and the group registry, which is the same KIND of
+                      # thing as a membership: a name for a set of people, not
+                      # the record of what was found
+                      ("PUT", "/v1/groups/{group_id}"),
+                      ("DELETE", "/v1/groups/{group_id}"),
+                      ("PUT", "/v1/groups/{group_id}/members/{orcid}"),
+                      ("DELETE", "/v1/groups/{group_id}/members/{orcid}")}, \
         f"unexpected write endpoints: {sorted(writes)}"
     assert not [p for p in paths if p.endswith("/study") or p.endswith("/graph")], \
         "no route may take a study away: the deletions are tombstones"
