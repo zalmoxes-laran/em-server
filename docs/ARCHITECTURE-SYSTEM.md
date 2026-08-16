@@ -162,6 +162,13 @@ Same NarrativeNode, same rendering engine, two outputs — and each one *says
 which it is*, in its own footer. A third rendering built separately would
 eventually disagree with the other two about what the study said.
 
+The live viewer is EMStudio's reader bundle, and em-catalog serves it as a
+**directory** (`/catalog/reader/`, `EM_CATALOG_READER` pointing at the built
+`dist/`) rather than as one file: the reader gave up its single-file build so the
+3D engine could be a chunk fetched only when a model appears. A deployment that
+bundles no reader answers **501** with the build command — not a blank page,
+which reads as an empty study.
+
 ### The infrastructure we did not invent
 
 | piece | what it is | why it is there |

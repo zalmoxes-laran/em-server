@@ -337,9 +337,9 @@ def main() -> int:
     ok("…and the catalogue is card-for-card what it was", after == before)
 
     # ── cleanup: the smoke leaves nothing behind ────────────────────────────
-    for study_id in (public_id, restricted_id):
-        request(f"{catalog}/catalog/study/{study_id}", method="DELETE",
-                headers=auth)
+    #for study_id in (public_id, restricted_id):
+    #    request(f"{catalog}/catalog/study/{study_id}", method="DELETE",
+    #            headers=auth)
 
     print()
     if SKIPS:
