@@ -72,6 +72,29 @@
       "realmRoles": [
         "default-roles-em-dev"
       ]
+    },
+    {
+      "username": "viewer",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Viewer",
+      "lastName": "User",
+      "email": "viewer@em.local",
+      "attributes": {
+        "orcid": [
+          "0000-0001-5109-3700"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "viewer",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-em-dev"
+      ]
     }
   ]
 }

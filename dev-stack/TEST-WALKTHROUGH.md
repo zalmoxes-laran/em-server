@@ -17,6 +17,24 @@ Da `~/Documents/GitHub/em-server` (servono i pacchetti `requests` e `minio`:
     python3 dev-stack/smoke_iiif.py     # immagini: MinIO → Cantaloupe → info.json/thumbnail/regione + manifest IIIF
     python3 dev-stack/smoke_catalog.py  # Catalog: registra studi, public/restricted, TTL-publish nasconde il tombstone,
                                         #          e RICOSTRUISCE l'indice dai container in MinIO (l'indice è derivato)
+    python3 dev-stack/smoke_embargo_viewer.py
+                                        # il CANCELLO con una persona vera: viewer→403 (con la data), dev→200,
+                                        #          anonimo→401, embargo tolto→200 per tutti
+
+**Il secondo utente del realm.** `smoke_embargo_viewer.py` usa l'utente `viewer`
+(password `viewer`), seminato in `dev-stack/keycloak/realm-em-dev.json`. Un
+Keycloak avviato **prima** che quella riga esistesse non ce l'ha, e lo smoke lo
+dice invece di fallire nel vago. Il realm si ri-importa ricreando il container
+(`start-dev` tiene il realm nel database del container):
+
+    cd dev-stack && docker-compose -f docker-compose.dev.yml --env-file .env.dev \
+        up -d --force-recreate keycloak
+
+Con il re-import nascono **chiavi di realm nuove**: i token emessi prima smettono
+di verificare — atteso, non un guasto. Un token per l'uno o per l'altro:
+
+    ./dev-stack/token.sh                 # dev   (owner della stanza che tocca)
+    ./dev-stack/token.sh --user viewer   # viewer (autenticato, senza membership)
 
 Atteso: tutti verdi, **zero SKIP** (con `minio` installato, gli smoke aprono il bucket e verificano da soli —
 non si fidano della parola di em-server).
@@ -65,7 +83,43 @@ Nell'app, in quest'ordine:
 Prende il token da `dev-stack/token.sh` e la CA da `~/caddy-em-root.crt` da sé. Per provare la porta diretta
 invece di Caddy: `EM_HUB_BASE=http://localhost:8000 node scripts/check-room-live.mjs`.
 
-**5 · il test forte, a due macchine**: un **secondo** EMStudio sull'altro Mac, `./fcn-up.sh <mac>.local` (il nome
+**5 · la geometria che scende (DP-76, metà che consuma)**: in Blender, pannello
+**EM ▸ EMStudio Sync**, dentro una stanza → **«Materialize geometry from the
+store»**. Atteso: i modelli che il grafo referenzia e che vivono nello store
+compaiono in scena, legati alle loro epoche; premuto una seconda volta non
+scarica e non duplica (l'oggetto porta già il suo `sha256`); un modello embargato
+è **saltato con la ragione** e la scena resta intera.
+
+Questa è la **controprova umana**. La prova ripetibile è headless, e sono due:
+
+    cd ~/Documents/GitHub/EM-blender-tools
+    .venv/bin/python -m pytest tests/test_room_materialise.py -q   # 13 · la funzione pura
+    EM_ROOM_URL=http://localhost:8000 EM_ROOM_ID=basilica-demo \
+      EM_ROOM_TOKEN=$(~/Documents/GitHub/em-server/dev-stack/token.sh) \
+      EM_ASSET_SHA256=sha256:<un glb resident della stanza> \
+      "/Applications/Blender 520.app/Contents/MacOS/Blender" --background \
+        --python tests/blender_smoke_materialise.py                # 18 · L'OPERATORE
+
+Il secondo **registra l'addon** (è la Blender vera, con l'estensione abilitata),
+entra davvero nella stanza e preme il bottone: è l'unico posto dove
+`EM_ep_belong_ob` esiste, quindi l'unico che può misurare che il legame
+all'epoca viene **scritto** e non solo annunciato.
+
+> **La libreria dell'addon è una COPIA.** EMtools spedisce s3dgraphy come wheel,
+> che Blender installa nel site-packages dell'estensione: una Blender abilitata
+> prima che la libreria crescesse `geometry_summary` ha una copia più vecchia
+> **con la stessa stringa di versione** (misurato: 1.6.0.dev14 da entrambe le
+> parti). Se il bottone dice «this Blender's s3dgraphy … predates DP-76's
+> consuming half», la cura è ricostruire il wheel e reinstallarlo:
+>
+>     cd ~/Documents/GitHub/s3Dgraphy && .venv/bin/pip wheel . --no-deps \
+>         -w ~/Documents/GitHub/EM-blender-tools/wheels/cp313
+>     "/Applications/Blender 520.app/Contents/Resources/5.2/python/bin/python3.13" \
+>         -m pip install --target "$HOME/Library/Application Support/Blender/5.2/extensions/.local/lib/python3.13/site-packages" \
+>         --upgrade --no-deps --no-index \
+>         ~/Documents/GitHub/EM-blender-tools/wheels/cp313/s3dgraphy-*.whl
+
+**6 · il test forte, a due macchine**: un **secondo** EMStudio sull'altro Mac, `./fcn-up.sh <mac>.local` (il nome
 Bonjour, mai un IP nudo → rompe il TLS della CA interna), stessa stanza `basilica-demo` → editi di qua, compare
 di là in tempo reale. Sull'altro Mac va copiato e fidato anche `caddy-em-root.crt`.
 

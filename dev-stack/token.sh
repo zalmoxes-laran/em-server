@@ -21,8 +21,15 @@ usage() {
     cat >&2 <<'TXT'
 token.sh — a dev access token from the local Keycloak realm.
 
-    ./dev-stack/token.sh              print the access token
+    ./dev-stack/token.sh              print the access token (user: dev)
     ./dev-stack/token.sh | pbcopy     …and put it on the clipboard
+    ./dev-stack/token.sh --user viewer
+                                      a token for another seeded user. `viewer`
+                                      is an ordinary authenticated identity with
+                                      no room membership — which is what an
+                                      embargo gate refuses (403). The password
+                                      is the username unless DEV_PASSWORD says
+                                      otherwise
     ./dev-stack/token.sh --claims     print the token's claims instead (aud, iss,
                                       preferred_username, expiry) — the three
                                       things worth looking at when a room says 4401
@@ -35,9 +42,22 @@ a room stops accepting it, run this again — that is the expiry, not a fault.
 TXT
 }
 
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-esac
+WANTED_USER=""
+CLAIMS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --claims)  CLAIMS=1; shift ;;
+        # A SECOND seeded user, by name. Added for the embargo end-to-end: the
+        # gate refuses anybody below editor, and with one user in the realm
+        # there was nobody to be refused — the 403 could only be measured
+        # against a stand-in. The password defaults to the username, which is
+        # what the realm seeds.
+        --user)    WANTED_USER="${2:-}"; shift 2 ;;
+        --user=*)  WANTED_USER="${1#*=}"; shift ;;
+        *)         echo "unknown argument: $1" >&2; usage; exit 2 ;;
+    esac
+done
 
 # `.env.dev` first, environment on top: the same order every other script here
 # uses, so one exported variable overrides one line of the file and nothing else.
@@ -56,6 +76,12 @@ CLIENT_ID="$(env_of DEV_CLIENT_ID em-server)"
 CLIENT_SECRET="$(env_of DEV_CLIENT_SECRET em-dev-secret)"
 USERNAME="$(env_of DEV_USER dev)"
 PASSWORD="$(env_of DEV_PASSWORD dev)"
+if [[ -n "$WANTED_USER" ]]; then
+    USERNAME="$WANTED_USER"
+    # the seeded users have their username as password; an exported DEV_PASSWORD
+    # still wins, so a realm with real passwords keeps working
+    PASSWORD="${DEV_PASSWORD:-$WANTED_USER}"
+fi
 
 ENDPOINT="http://localhost:${KEYCLOAK_PORT}/realms/${REALM}/protocol/openid-connect/token"
 
@@ -80,7 +106,7 @@ if [[ -z "$token" ]]; then
     exit 1
 fi
 
-if [[ "${1:-}" == "--claims" ]]; then
+if [[ -n "$CLAIMS" ]]; then
     # Decoded, NOT verified — this prints what the token says about itself, which
     # is what you want when a room refuses it. em-server is the one that checks
     # the signature, and it is right to be the only one that does.
