@@ -30,7 +30,8 @@ What it asserts, in the order the day happens:
 6. a room name **invented in the URL** grants nothing (the owner bootstrap must
    not turn a URL into a role);
 7. `GET /v1/corpus?sha256=…` returns the **slice** about that file, with its
-   chain, and the corpus **version** is the content digest.
+   chain — open to any authenticated caller — while the **whole** register is a
+   **curation read** (403 with the remedy unless this instance declares curators).
 
 Exit code 0 only if every assertion held. Each line is printed as it is measured,
 because a smoke test that only says "ok" is one nobody can debug.
@@ -207,25 +208,42 @@ def main() -> int:
                         f"/asset/{ref}", token=viewer)
     check(status == 403, f"a room typed into the URL does not open it ({status})")
 
-    # ── 7 · the register reads back, and slices ──────────────────────────────
+    # ── 7 · the register reads back: the SLICE for anyone, the WHOLE for a curator
     print("\n7 · GET /v1/corpus")
-    status, _, raw = call("GET", f"{base}/corpus", token=owner)
-    whole = json.loads(raw)
-    check(status == 200 and whole["nodes"] > 0,
-          f"the corpus has {whole['nodes']} nodes, {whole['edges']} edges")
-    check(whole["graph"]["data"]["em_collection"] == "DTCCorpus",
-          "…and it is marked as a corpus")
     status, _, raw = call("GET", f"{base}/corpus?sha256={ref}", token=owner)
     part = json.loads(raw)
+    check(status == 200 and part["sliced"] is True,
+          f"the slice is open to an authenticated caller ({status})")
     names = [n.get("name") for n in part["graph"]["nodes"]]
-    check(part["sliced"] is True and part["nodes"] <= whole["nodes"],
-          f"the slice about this file: {names}")
+    check(bool(names), f"the slice about this file: {names}")
     check(any(str(n).startswith("CC-BY") for n in names),
           "…carries its licence, or the slice would answer the rights wrongly")
-    check(part["version"] == whole["version"],
-          "a slice reports the version of the register it came from")
-    print(f"    version {whole['version']}")
-    print(f"    store   {whole['store']}")
+    status, _, raw = call("GET", f"{base}/corpus?sha256={ref}", token=viewer)
+    check(status == 200, f"…and to a viewer, who cites those files too ({status})")
+
+    status, _, raw = call("GET", f"{base}/corpus", token=viewer)
+    if status == 403:
+        detail = json.loads(raw).get("detail", "")
+        check("curation" in detail and "sha256" in detail,
+              f"the WHOLE register is a curation read: 403 that names the remedy")
+    else:
+        check(status == 200,
+              f"the whole register is open on this instance "
+              f"(EM_CORPUS_OPEN / a curator list) — {status}")
+    status, _, raw = call("GET", f"{base}/corpus", token=owner)
+    whole = json.loads(raw) if status == 200 else part
+    check(status in (200, 403), f"the whole read, as the owner: {status}")
+    if status == 200:
+        check(whole["graph"]["data"]["em_collection"] == "DTCCorpus",
+              f"the corpus has {whole['nodes']} nodes, {whole['edges']} edges "
+              f"and is marked as a corpus")
+        check(part["version"] == whole["version"],
+              "a slice reports the version of the register it came from")
+        print(f"    version {whole['version']}")
+        print(f"    store   {whole['store']}")
+    else:
+        print("    (the owner is not a declared curator here: "
+              "set EM_CORPUS_CURATORS to read the lot)")
 
     print(f"\n{checks - len(failures)}/{checks} checks passed")
     for bad in failures:

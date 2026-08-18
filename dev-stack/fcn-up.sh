@@ -10,6 +10,10 @@
 # NB: la CA interna di Caddy NON fa certificati per un IP nudo → per l'altro computer
 # serve un HOSTNAME (il nome Bonjour `<mac>.local`, o /etc/hosts, o un dominio vero),
 # non 172.x.x.x. E la rete deve vedersi (hotspot che isola i client → travel-router/Tailscale).
+#
+# DATI: i volumi (studi, stanze, bucket asset+corpus, realm, CA di Caddy) PERSISTONO fra i
+# riavvii — `./fcn-down.sh` poi `./fcn-up.sh` (o un restart dei container) ritrova tutto.
+# Solo `./fcn-down.sh --wipe` cancella i volumi (dati persi; dopo serve ./fcn-trust-ca.sh).
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} /^[[:space:]]*$/{next} {exit}' "$0"; exit 0
 fi
@@ -70,6 +74,8 @@ $( [ -n "$BONJOUR" ] && [ "$BONJOUR" != "$PRIMARY" ] && echo "  Per l'ALTRO comp
 Note:
   · la ROOT (/) è vuota: apri un percorso vero — /em/v1/health , /catalog/ , /iiif/…
   · certificato: se il browser lo rifiuta → ./fcn-trust-ca.sh (una volta; e dopo ogni --wipe).
+  · dati: studi/stanze/asset/corpus PERSISTONO fra i riavvii (volumi named). ./fcn-down.sh li
+    tiene; solo ./fcn-down.sh --wipe li cancella.
   · altro computer: serve un HOSTNAME (mai IP nudo, rompe il TLS della CA interna) e che le
     due macchine si vedano in rete (hotspot che isola → travel-router · Internet-Sharing · Tailscale).
     Per usarlo come primario:  ./fcn-up.sh ${BONJOUR:-<mac>.local}

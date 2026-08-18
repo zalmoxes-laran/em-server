@@ -83,6 +83,9 @@ Two notes for whoever runs it:
 | `em_catalog_couchdb_enabled` | `true` | the Catalog's index in CouchDB. Off ⇒ SQLite on a volume |
 | `em_server_audience` / `em_catalog_audience` | `em-server` | the audience each service requires in a token |
 | `minio_root_user` / `_password`, `couchdb_user` / `_password` | **none** | from the inventory or the Vault |
+| `EM_CORPUS_CURATORS` (env on em-server) | **empty** | the ORCIDs allowed to read the **whole** resident DTC corpus. The register's per-file **slice** (`GET /v1/corpus?sha256=…`) is open to any authenticated caller — that is what clients use — but the lot is the provenance of every study on the instance, so it is a curation read and it is **off until somebody is named**. A refusal is a 403 that says so |
+| `EM_CORPUS_OPEN` (env on em-server) | unset | `1` opens the whole read to any authenticated caller. For a single-user instance; kept as one visible setting rather than a special case in the code |
+| `EM_CORPUS_DIR` (env on em-server) | falls back to `EM_SNAPSHOT_DIR` | where the resident corpus lives **when there is no MinIO**. With MinIO configured the register rides in the same bucket as the assets it describes (`em/corpus.em.json`) and needs no setting |
 
 The URL topology is **already correct** in the templates: em-server writes
 `https://<server_name>/iiif/3` into its manifests and dials

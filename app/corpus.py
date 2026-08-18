@@ -309,6 +309,86 @@ def slice_for(section: Dict[str, Any], digests: List[str]) -> Dict[str, Any]:
                       and str(e.get("target") or e.get("edge_target") or "") in keep]}
 
 
+# ── who may read the WHOLE register ──────────────────────────────────────────
+#
+# The slice is a citation: `?sha256=…` asks about files the caller already holds
+# the digests of, and answering is what the register is for. **The whole thing is
+# a different question**: it is the provenance of every study on the instance —
+# who photographed what, for whom, under which embargo — and an authenticated
+# stranger has no business reading the lot just because they can log in.
+#
+# The rule, and it is deliberately crude (a full role model over the register is
+# curation policy, not a line of code):
+#
+# * **off by default.** The whole corpus is NOT a client path — EMStudio always
+#   slices — so nothing legitimate breaks, and an instance that never configures
+#   anything never exposes the lot. Defaults decide what most deployments do;
+# * `EM_CORPUS_CURATORS` — a comma-separated list of ORCIDs who may read it. That
+#   is the curation role: the people who look after the register;
+# * `EM_CORPUS_OPEN=1` — the escape hatch for a single-user laptop, stated in one
+#   place so it shows up in a config review.
+#
+# A refusal is a **403 with the reason and the remedy**, never a 500 and never an
+# empty answer: "you got nothing" and "there is nothing" must not look alike.
+
+def curators(environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """The ORCIDs allowed to read the whole register."""
+    env = environ if environ is not None else os.environ
+    raw = env.get("EM_CORPUS_CURATORS") or ""
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def whole_read_open(environ: Optional[Dict[str, str]] = None) -> bool:
+    """Is the whole register open to any authenticated caller? (Off by default.)"""
+    env = environ if environ is not None else os.environ
+    return (env.get("EM_CORPUS_OPEN") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def may_read_whole(orcid: Optional[str], *, dev_mode: bool = False,
+                   environ: Optional[Dict[str, str]] = None) -> bool:
+    """May this caller read the WHOLE corpus?
+
+    Dev mode is yes for the same reason it is `owner` everywhere else: with no
+    OIDC there are no identities to distinguish, and a lock drawn on a door with
+    no wall is theatre (`ws.authorize` says it first).
+    """
+    if dev_mode:
+        return True
+    if whole_read_open(environ):
+        return True
+    allowed = curators(environ)
+    return bool(orcid) and orcid in allowed
+
+
+def whole_read_refusal(environ: Optional[Dict[str, str]] = None) -> str:
+    """The sentence a refusal carries: what was refused, and what to do instead."""
+    named = curators(environ)
+    who = (f"the curators of this register ({len(named)} declared)" if named
+           else "nobody yet — no curator is configured")
+    return ("the WHOLE documentation of this instance is the provenance of every "
+            "study on it, and reading it is a curation act: it is open to "
+            f"{who}. Ask about the files you hold instead — "
+            "GET /v1/corpus?sha256=<digest>,<digest> answers about those, with "
+            "their chain. An operator opens the whole read with "
+            "EM_CORPUS_CURATORS=<orcid>,… (or EM_CORPUS_OPEN=1 for a single-user "
+            "instance).")
+
+
+def _marked(section: Dict[str, Any]) -> Dict[str, Any]:
+    """The section, guaranteed to still SAY it is a corpus.
+
+    `build_emjson` carries `graph.data` through, but a corpus that lost the marker
+    would come back as "a graph called dtc" — and the shelf/corpus distinction is
+    exactly what the marker exists for.
+    """
+    from s3dgraphy.dtc.corpus import DTC_CORPUS_COLLECTION
+
+    data = section.setdefault("data", {})
+    if not data.get("em_collection"):
+        data["em_collection"] = DTC_CORPUS_COLLECTION
+    return section
+
+
 class ResidentCorpus:
     """The instance's corpus, read through a store and written back atomically.
 
@@ -366,9 +446,27 @@ class ResidentCorpus:
         ingest all perform, and a server that re-implemented them would be the
         fourth dialect of the same sentence.
 
-        Returns `(report, version)`. The write is atomic (the store replaces the
-        object) and the ops are idempotent (same act twice converges), so a client
-        that retries after a timeout does not double anything.
+        Returns `(report, version)`. The ops are idempotent (the same act twice
+        converges), so a client that retries after a timeout does not double
+        anything.
+
+        **NOTHING IS LOST IN CONCURRENCY**, and it takes two fences because the
+        register is shared:
+
+        * a **lock** serialises the read→apply→write of this process. It is the
+          simple, exactly-correct answer for one process over one object, and it
+          is why two clients appending at the same instant both land;
+        * a **last-moment merge**: after applying, the store is read AGAIN, and if
+          it moved under us (another process — a second replica, an operator's
+          script) our result is merged into that newer state instead of replacing
+          it. Per-UUID, additive, the library's own merge (`merge_corpus`) — so
+          the act that arrived meanwhile is not calpestato.
+
+        The declared gap: this is compare-then-write, not compare-and-swap. Two
+        replicas can still interleave between the re-read and the put, and closing
+        that needs a conditional put (S3 preconditions / `If-Match`). What the
+        merge buys is that the *likely* race — an act landing during a slow
+        read-modify-write — costs nothing, instead of silently costing an act.
 
         Raises `ValueError` for an act nobody implements or an argument the
         library refuses — the caller turns that into a 400 with the sentence.
@@ -377,21 +475,28 @@ class ResidentCorpus:
         from s3dgraphy.exporter.emjson_exporter import build_emjson
         from s3dgraphy.importer.emjson_importer import parse_emjson
 
+        header = {"header": {"format": "em.json", "version": "1.0"}}
         with self._lock:
-            section = copy.deepcopy(self.read())
-            graph, _warnings = parse_emjson({"header": {"format": "em.json",
-                                                        "version": "1.0"},
-                                             "graph": section})
+            before = self.read()
+            base_digest = canonical_digest(before)
+            graph, _warnings = parse_emjson({**header,
+                                             "graph": copy.deepcopy(before)})
             report = _perform(em, graph, act, payload, author=author)
-            written = build_emjson(graph)["graph"]
-            # the marker is the identity of this member: `build_emjson` carries
-            # `graph.data` through, but a corpus that lost it would come back as
-            # "a graph called dtc" — and the shelf/corpus distinction is exactly
-            # what the marker exists for
-            data = written.setdefault("data", {})
-            if not data.get("em_collection"):
-                from s3dgraphy.dtc.corpus import DTC_CORPUS_COLLECTION
-                data["em_collection"] = DTC_CORPUS_COLLECTION
+            written = _marked(build_emjson(graph)["graph"])
+
+            # …did anything land while we were working?
+            latest = self.read()
+            if canonical_digest(latest) != base_digest:
+                mine, _ = parse_emjson({**header, "graph": written})
+                theirs, _ = parse_emjson({**header,
+                                          "graph": copy.deepcopy(latest)})
+                # THEIRS is the base and MINE folds into it: the other act is
+                # already durable and this one is the newcomer, so the merge runs
+                # in the direction that cannot drop what is already stored.
+                from s3dgraphy.dtc.corpus import merge_corpus
+                merge_corpus(theirs, mine)
+                written = _marked(build_emjson(theirs)["graph"])
+
             self.store.put(written)
             return report, canonical_digest(written)
 
@@ -413,11 +518,7 @@ class ResidentCorpus:
             mine, _ = parse_emjson({**header, "graph": copy.deepcopy(self.read())})
             theirs, _ = parse_emjson({**header, "graph": copy.deepcopy(incoming)})
             report = merge_corpus(mine, theirs)
-            written = build_emjson(mine)["graph"]
-            data = written.setdefault("data", {})
-            if not data.get("em_collection"):
-                from s3dgraphy.dtc.corpus import DTC_CORPUS_COLLECTION
-                data["em_collection"] = DTC_CORPUS_COLLECTION
+            written = _marked(build_emjson(mine)["graph"])
             self.store.put(written)
             return report, canonical_digest(written)
 

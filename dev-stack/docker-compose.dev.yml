@@ -224,6 +224,13 @@ services:
       MINIO_SECURE: "false"
       # --- room documents ----------------------------------------------------
       EM_SNAPSHOT_DIR: "/srv/em-data/snapshots"
+      # --- the resident DTC corpus ------------------------------------------
+      # The register rides in the MinIO bucket above (no setting needed for that).
+      # What DOES need saying is who may read the WHOLE of it: the lot is the
+      # provenance of every study on the instance, so it is a CURATION read and
+      # off by default. Here the dev user is the curator, which is what lets
+      # `smoke_corpus_resident.py` measure the whole read as well as the slice.
+      EM_CORPUS_CURATORS: "${DEV_CURATOR_ORCID:-0000-0002-1825-0097}"
       # --- images · the URL topology (docs/URL-TOPOLOGY.md) --------------------
       # PUBLIC: what goes into a manifest. Other people's viewers fetch it, so it
       # must name a host they can reach — `localhost` here, the proxy's name in

@@ -129,3 +129,6 @@ di là in tempo reale. Sull'altro Mac va copiato e fidato anche `caddy-em-root.c
 - Altro computer: serve un **hostname** (Bonjour `.local` / hosts / dominio), mai un IP nudo (rompe il TLS
   della CA interna), e le due macchine devono vedersi in rete (hotspot che isola → travel-router / Tailscale).
 - Spegni: `./fcn-down.sh` (o `--stop` / `--wipe` / `--colima`).
+- **Persistenza:** i dati (studi, stanze, **asset e corpus** in MinIO, realm, CA) vivono su volumi *named* e
+  **restano fra i riavvii** — `./fcn-down.sh` poi `./fcn-up.sh` (o un restart) li ritrova. **Solo `--wipe`
+  cancella** tutto (e dopo serve `./fcn-trust-ca.sh` per la nuova CA). `--help` di `fcn-down`/`fcn-up` lo ricorda.

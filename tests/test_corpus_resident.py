@@ -272,7 +272,7 @@ def test_an_attribution_with_nobody_to_sign_it_is_refused(client, resident,
 
 
 def test_a_slice_answers_about_those_files_and_keeps_their_chain(
-        client, resident, assets, whoever):
+        client, resident, assets, whoever, monkeypatch):
     whoever(ANNA)
     section = resident.read()
     section["nodes"].append(resource_node(assets["picture"]))
@@ -285,6 +285,9 @@ def test_a_slice_answers_about_those_files_and_keeps_their_chain(
         "act": "attribution", "checksum": assets["picture"],
         "license": "CC-BY-4.0"}).status_code == 200
 
+    # the WHOLE register is a curation read (see the gating tests below), so this
+    # comparison asks for it AS a curator; the slice needs no title
+    monkeypatch.setenv("EM_CORPUS_CURATORS", ANNA)
     whole = client.get("/v1/corpus", headers=HEAD).json()
     part = client.get("/v1/corpus", headers=HEAD,
                       params={"sha256": assets["picture"]}).json()
@@ -324,6 +327,140 @@ def test_a_slice_of_a_digest_nobody_documented_is_empty_not_the_whole_corpus():
     empty = slice_for(section, ["sha256:" + "ef" * 32])
     assert empty["nodes"] == [] and empty["edges"] == []
     assert empty["data"]["em_collection"] == "DTCCorpus", "still a corpus"
+
+
+def test_two_appends_at_the_same_time_BOTH_land(client, resident, assets):
+    """The register is shared, so `append` is a read-modify-write on one object —
+    and two of them at once used to mean the last writer won and the other act was
+    simply gone. Two threads, two different lots, one corpus: both."""
+    import threading
+
+    section = resident.read()
+    section["nodes"].append(resource_node(assets["picture"]))
+    section["nodes"].append(resource_node(assets["other"], "IMG_0002.png"))
+    resident.store.put(section)
+
+    outcome: dict[str, object] = {}
+
+    def append(which: str, digest: str, lot: str) -> None:
+        try:
+            outcome[which] = resident.append(
+                "acquisition", {"resources": [digest], "name": lot}, author=ANNA)
+        except Exception as exc:  # noqa: BLE001 — the test reports, never hides
+            outcome[which] = exc
+
+    threads = [threading.Thread(target=append, args=("a", assets["picture"], "Volo A")),
+               threading.Thread(target=append, args=("b", assets["other"], "Volo B"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not any(isinstance(v, Exception) for v in outcome.values()), outcome
+    lots = sorted(n["name"] for n in resident.read()["nodes"]
+                  if n.get("node_type") == "dtc_acquisition")
+    assert lots == ["Volo A", "Volo B"], \
+        "both acts are in the register: neither overwrote the other"
+
+
+def test_an_act_that_lands_DURING_another_one_is_not_overwritten(resident, assets):
+    """The second fence, for the case a lock cannot cover: another PROCESS wrote
+    while this one was working. Simulated by writing to the store from inside the
+    apply — which is exactly what a second replica looks like from here."""
+    section = resident.read()
+    section["nodes"].append(resource_node(assets["picture"]))
+    resident.store.put(section)
+
+    # somebody else's act, injected between our read and our write
+    intruder = ResidentCorpus(resident.store)
+    real_read = resident.read
+    fired = {"done": False}
+
+    def read_then_let_somebody_else_write():
+        got = real_read()
+        if not fired["done"]:
+            fired["done"] = True
+            intruder.append("acquisition",
+                            {"resources": [assets["picture"]], "name": "Volo altrui"},
+                            author=CARLA)
+        return got
+
+    resident.read = read_then_let_somebody_else_write  # type: ignore[method-assign]
+    resident.append("acquisition",
+                    {"resources": [assets["picture"]], "name": "Volo mio"},
+                    author=ANNA)
+    resident.read = real_read  # type: ignore[method-assign]
+
+    lots = sorted(n["name"] for n in resident.read()["nodes"]
+                  if n.get("node_type") == "dtc_acquisition")
+    assert lots == ["Volo altrui", "Volo mio"], \
+        "the act that arrived meanwhile survived: the write MERGED, it did not replace"
+
+
+def test_retrying_the_same_act_after_a_timeout_does_not_double_it(resident, assets):
+    section = resident.read()
+    section["nodes"].append(resource_node(assets["picture"]))
+    resident.store.put(section)
+    body = {"resources": [assets["picture"]], "name": "Volo unico"}
+    first_report, first_version = resident.append("acquisition", body, author=ANNA)
+    again_report, again_version = resident.append("acquisition", body, author=ANNA)
+
+    assert again_report["acquisition_id"] == first_report["acquisition_id"]
+    assert again_version == first_version, "the version measures the corpus, not the calls"
+    lots = [n for n in resident.read()["nodes"]
+            if n.get("node_type") == "dtc_acquisition"]
+    assert len(lots) == 1
+
+
+# ── A″ · who may read the WHOLE register ─────────────────────────────────────
+
+def test_the_whole_register_is_refused_to_an_ordinary_caller_and_says_why(
+        client, resident, assets, whoever, monkeypatch):
+    """A digest is a citation; the lot is the provenance of every study on the
+    instance. Being able to log in is not a reason to read all of it."""
+    monkeypatch.delenv("EM_CORPUS_CURATORS", raising=False)
+    monkeypatch.delenv("EM_CORPUS_OPEN", raising=False)
+    whoever(CARLA)
+
+    refused = client.get("/v1/corpus", headers=HEAD)
+    assert refused.status_code == 403
+    detail = refused.json()["detail"]
+    assert "curation" in detail and "sha256" in detail, \
+        "the refusal names what to ask for instead: an empty answer would lie"
+    assert "EM_CORPUS_CURATORS" in detail, "…and how an operator opens it"
+
+    # …while the SLICE is exactly what this caller may have
+    section = resident.read()
+    section["nodes"].append(resource_node(assets["picture"]))
+    resident.store.put(section)
+    ok = client.get("/v1/corpus", headers=HEAD,
+                    params={"sha256": assets["picture"]})
+    assert ok.status_code == 200 and ok.json()["sliced"] is True
+
+
+def test_a_declared_curator_reads_the_whole_register(client, resident, assets,
+                                                     whoever, monkeypatch):
+    monkeypatch.setenv("EM_CORPUS_CURATORS", f"{ANNA}, 0000-0009-0009-0009")
+    whoever(ANNA)
+    assert client.get("/v1/corpus", headers=HEAD).status_code == 200
+    whoever(CARLA)
+    assert client.get("/v1/corpus", headers=HEAD).status_code == 403, \
+        "a list of curators is a list, not a door left open"
+
+
+def test_a_single_user_instance_can_open_it_in_one_place(client, resident,
+                                                         whoever, monkeypatch):
+    monkeypatch.delenv("EM_CORPUS_CURATORS", raising=False)
+    monkeypatch.setenv("EM_CORPUS_OPEN", "1")
+    whoever(CARLA)
+    assert client.get("/v1/corpus", headers=HEAD).status_code == 200
+
+
+def test_dev_mode_reads_everything_because_it_has_no_identities(client, resident):
+    """No `whoever`: no OIDC, so every caller is the same anonymous nobody and a
+    lock here would be a lock drawn on a door with no wall (`ws.authorize` says it
+    first, for rooms)."""
+    assert client.get("/v1/corpus", headers=HEAD).status_code == 200
 
 
 # ── A′ · the promote: a file corpus comes home ───────────────────────────────

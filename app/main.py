@@ -50,7 +50,8 @@ from .assets import describe as asset_describe
 from .auth import AuthDependency, authenticator
 from .access import Acl, Group, Role, may_assign, parse_role
 from .access import describe as acl_describe
-from .corpus import CORPUS_STORE, RESIDENT, canonical_digest
+from .corpus import (CORPUS_STORE, RESIDENT, canonical_digest, may_read_whole,
+                     whole_read_refusal)
 from .corpus import describe as corpus_describe
 from .digest_index import INDEX as DIGEST_INDEX
 from .store import describe as snapshot_describe
@@ -679,15 +680,20 @@ class CorpusAppendOut(BaseModel):
     by: Optional[str] = None
 
 
-@v1.get("/corpus", response_model=CorpusOut, tags=["corpus"])
+@v1.get("/corpus", response_model=CorpusOut, tags=["corpus"], responses={
+    403: {"description": "the WHOLE register is a curation read; ask for a slice"},
+})
 def get_corpus(
+    request: Request,
     sha256: Optional[List[str]] = Query(
         default=None,
         description="one or more digests: the answer is the part of the corpus "
                     "that speaks about those files (repeat the parameter, or "
-                    "pass a comma-separated list)"),
+                    "pass a comma-separated list). WITHOUT this the whole "
+                    "register is asked for, which is a curation read"),
 ) -> CorpusOut:
-    """The instance's documentation — whole, or the slice a study needs.
+    """The instance's documentation — the slice a study needs, or (for a curator)
+    the whole thing.
 
     A study cites a handful of assets out of a register that may hold thousands,
     so the slice is not an optimisation: sending the whole corpus to draw four
@@ -696,10 +702,25 @@ def get_corpus(
     that brought them in, the transformation that made them, their rights) —
     reached by walking the DTC edges, because an acquisition without its licence
     node would answer the rights question wrongly.
+
+    **The slice is open to any authenticated caller; the WHOLE register is not.**
+    A digest is a citation — asking about a file you hold is the register's
+    purpose. The lot is something else: the provenance of every study on this
+    instance, which is a curation read (`app/corpus.py` says who, and why the
+    default is off). The refusal names the remedy rather than returning an empty
+    answer, because "you got nothing" and "there is nothing" must not look alike.
     """
     digests: List[str] = []
     for raw in sha256 or []:
         digests.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    if not digests:
+        principal = authenticator.require_token(request)
+        dev_mode = bool(principal.get("em_dev_mode"))
+        who = None if dev_mode else (principal.get("orcid")
+                                     or principal.get("preferred_username")
+                                     or principal.get("sub"))
+        if not may_read_whole(who, dev_mode=dev_mode):
+            raise HTTPException(status_code=403, detail=whole_read_refusal())
     section = RESIDENT.read_slice(digests or None)
     whole = RESIDENT.read()
     return CorpusOut(
