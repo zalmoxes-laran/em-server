@@ -50,6 +50,8 @@ from .assets import describe as asset_describe
 from .auth import AuthDependency, authenticator
 from .access import Acl, Group, Role, may_assign, parse_role
 from .access import describe as acl_describe
+from .corpus import CORPUS_STORE, RESIDENT, canonical_digest
+from .corpus import describe as corpus_describe
 from .digest_index import INDEX as DIGEST_INDEX
 from .store import describe as snapshot_describe
 from . import ws as _ws
@@ -198,6 +200,10 @@ class Health(BaseModel):
     #: the third piece of room state: a deployment whose grants die with the
     #: process would silently re-open every restricted room on restart.
     acl_store: str = "memory"
+    #: and where the RESIDENT DTC CORPUS lives — the documentation the asset gate
+    #: reads a licence and an embargo out of. An operator who reads "memory" knows
+    #: the rights they declared die with the process.
+    corpus_store: str = "memory"
 
 
 @v1_public.get("/health", response_model=Health, tags=["meta"])
@@ -231,6 +237,7 @@ def health() -> Health:
         snapshot_store=snapshot_describe(snapshot_store()),
         asset_store=asset_describe(ASSET_STORE),
         acl_store=acl_describe(ACL_STORE),
+        corpus_store=corpus_describe(CORPUS_STORE),
         rooms=len(rooms().rooms()),
     )
 
@@ -318,6 +325,11 @@ async def get_asset(room_id: str, ref: str, request: Request) -> Response:
     # store is not partitioned by room. A gate you get past by typing another
     # room name is not a gate.
     rights = await _rights_seen_anywhere(room_id, ref, request)
+    # …AND THE RESIDENT CORPUS. This is the hole that was measured: the licence
+    # was declared in a corpus, and a corpus em-server does not hold cannot make
+    # anything bite. The register speaks about the BYTES, so it speaks whatever
+    # room the caller came through.
+    rights = await _corpus_gate(ref, request, door=room_id, room_rights=rights)
 
     meta = ASSET_STORE.head(ref) or {}
     headers = {"ETag": f'"{ref}"'}
@@ -442,6 +454,117 @@ async def _rights_seen_anywhere(room_id: str, ref: str,
     return first
 
 
+async def _corpus_gate(ref: str, request: Request, *, door: Optional[str],
+                       room_rights: Optional[Dict[str, Any]]
+                       ) -> Optional[Dict[str, Any]]:
+    """Apply — and report — what the RESIDENT CORPUS says about these bytes.
+
+    The register is per-instance and content-addressed, so it speaks about the
+    file rather than about a room: whichever door the caller came through, a
+    licence declared in the documentation is the licence of these bytes, and an
+    embargo declared there is an embargo on them.
+
+    **FAIL-CLOSED, like the room walk**: a corpus store that will not read raises
+    503. "I cannot read the documentation" must not be allowed to answer "yes" —
+    that was the bug `_asset_rights` was rewritten to remove, and a second reader
+    with the opposite reflex would put it back.
+
+    **Who overrides an embargo**: editor and above **in the room the request came
+    through** — the door is the room the caller is working in, and it is the room
+    that can grant them the role. When no room is named (a IIIF request with no
+    `?room=`) the rooms citing the digest are asked instead; when nothing cites it
+    at all, an embargoed file is refused to everybody until the date passes,
+    because there is no room in which anybody could be its editor. (Dev mode has
+    no identities and lets everything through, as everywhere else.)
+
+    Returns the rights to REPORT: the room's statement where it made one, filled
+    in from the corpus where it did not, and the **more restrictive** embargo of
+    the two — the same compounding rule the two embargo levels already follow.
+    """
+    try:
+        corpus_rights = RESIDENT.rights_for(_digest_of(ref))
+    except Exception as exc:  # noqa: BLE001 — fail-closed, exactly like a room
+        raise HTTPException(
+            status_code=503,
+            detail=f"cannot verify this asset's rights right now: the resident "
+                   f"documentation will not read ({type(exc).__name__}). The bytes "
+                   f"are not served until it does — an embargo that cannot be read "
+                   f"is not an embargo that can be ignored.") from None
+    if not corpus_rights:
+        return room_rights
+
+    if corpus_rights.get("embargo_active"):
+        allowed = False
+        if not authenticator.settings.enforcing:
+            allowed = True                     # dev mode has no identities
+        else:
+            # WHOSE FILE IT IS, first: the people named as its authors are the
+            # ones the embargo is protecting, not the ones it is protecting the
+            # file from. Refusing them their own photograph while it is under
+            # study would be the gate working against the person it works for.
+            me = _identity_of(request)
+            authors = {str(a.get("orcid") or "").strip()
+                       for a in corpus_rights.get("authors") or []}
+            if me and me in authors:
+                allowed = True
+            # …then a room where the caller may WRITE — resolved WITHOUT the
+            # owner bootstrap.
+            #
+            # Measured: naming a room nobody had ever created got 200, because a
+            # room with no owner makes the first authenticated arrival its OWNER
+            # (`ws.authorize`) — so a viewer walked around a corpus embargo by
+            # inventing a room name in the URL. Same shape as the room-shopping
+            # hole `_rights_seen_anywhere` exists for, one level up. Reading the
+            # grants without claiming any is the precise fix: an invented room has
+            # no ACL and its empty document names no owner, so it grants nothing,
+            # while a real editor of a room that was never saved still gets in.
+            candidates = ([door] if door else []) \
+                + [r for r in _rooms_holding(_digest_of(ref)) if r != door]
+            for candidate in [c for c in candidates if c and not allowed]:
+                role = await _role_without_bootstrap(candidate, me, request)
+                if role is not None and role.can_write:
+                    allowed = True
+                    break
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"this asset is under embargo until "
+                       f"{corpus_rights.get('embargo')} — until then it is "
+                       f"readable by the people working on the study (editor and "
+                       f"above)")
+    return _combine_rights(room_rights, corpus_rights)
+
+
+def _combine_rights(room: Optional[Dict[str, Any]],
+                    corpus: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Two statements about one file, reported as one answer.
+
+    The room is the more specific speaker (it is the study the caller opened), so
+    what it SAID wins; what it left unsaid the corpus fills in — which is the
+    whole point, because "nothing said" is exactly what the file corpus used to
+    leave behind. The **embargo compounds**: the later date wins, because a file
+    freed in one place and embargoed in another is embargoed.
+    """
+    if not corpus:
+        return room
+    if not room:
+        return corpus
+    out = dict(room)
+    if not out.get("license"):
+        for key in ("license", "license_effective", "license_is_default"):
+            if corpus.get(key) not in (None, ""):
+                out[key] = corpus[key]
+    if not out.get("authors") and corpus.get("authors"):
+        out["authors"] = corpus["authors"]
+    mine, theirs = str(out.get("embargo") or ""), str(corpus.get("embargo") or "")
+    if theirs and theirs > mine:      # ISO dates compare as strings
+        out["embargo"] = corpus["embargo"]
+        out["embargo_active"] = corpus.get("embargo_active")
+    if not out.get("via") and corpus.get("via"):
+        out["via"] = corpus["via"]
+    return out
+
+
 def _digest_of(ref: str) -> str:
     return str(ref).rsplit(":", 1)[-1].lower()
 
@@ -470,6 +593,200 @@ async def _role_in_room(room_id: str, request: Request):
         claims.get("orcid") or claims.get("preferred_username") or claims.get("sub"))
     room = await rooms().get(room_id)
     return authorize(room, orcid, dev_mode=bool(claims.get("em_dev_mode")))
+
+
+# ── the RESIDENT DTC corpus (the documentation this instance can enforce from) ─
+#
+# The hole it closes was measured on 17 Aug: an asset whose licence lived in a
+# per-project corpus FILE was served with `x-em-license: null`, because the
+# enforcement reads the rights out of a document em-server holds and a file on a
+# laptop is not one. Give the corpus a residence and the rights bite (see
+# `app/corpus.py` for why it is one per instance and not one per room).
+#
+# Transport only, per rule 1: the three acts are `s3dgraphy`'s
+# (`bucket_acquisition` / `declare_derivation` / `enrich_asset_dtc`) — the same
+# protocol EMStudio and EMtools perform — and the merge is the container's.
+
+
+class CorpusOut(BaseModel):
+    """The corpus, or the slice of it that was asked for."""
+
+    #: the em.json graph section, marked `em_collection: DTCCorpus`
+    graph: Dict[str, Any] = Field(default_factory=dict)
+    #: sha256 over the canonical JSON of the WHOLE corpus. The version is what
+    #: the corpus says, not how many times somebody saved — so a client can tell
+    #: "nothing changed" without diffing, and a slice still reports the version
+    #: of the register it came out of.
+    version: str = ""
+    nodes: int = 0
+    edges: int = 0
+    #: True when `sha256=` narrowed the answer — a client that asked for four
+    #: digests and got four nodes should not have to guess whether that is the
+    #: whole register.
+    sliced: bool = False
+    #: where the documentation lives, in the words `/v1/health` uses
+    store: str = ""
+
+
+class CorpusAct(BaseModel):
+    """One documentation act to append. `act` picks which, the rest is its body.
+
+    Deliberately ONE endpoint with a named act rather than three routes: the
+    three are the same kind of statement about the same register, they are all
+    idempotent, and a client that performs two of them in a row should not have
+    to learn two shapes.
+    """
+
+    act: str = Field(description="acquisition | derivation | attribution")
+    #: acquisition: the files (ids **or** digests) and how the lot is described
+    resources: Optional[List[str]] = None
+    acquisition_id: Optional[str] = None
+    name: Optional[str] = None
+    dtc_kind: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    #: derivation: what came out, and what went in (an acquisition counts as one)
+    output: Optional[str] = None
+    inputs: Optional[List[str]] = None
+    tool: Optional[str] = None
+    process_id: Optional[str] = None
+    #: resource: a file the register should know about — `checksum` is the door,
+    #: and for a RESIDENT one em-server checks its own store before believing it
+    media_type: Optional[str] = None
+    residency: Optional[str] = None
+    url: Optional[str] = None
+    url_type: Optional[str] = None
+    scope: Optional[str] = None
+    size: Optional[int] = None
+    #: attribution: whose file this is and what may be done with it
+    checksum: Optional[str] = None
+    author: Optional[str] = None
+    author_name: Optional[str] = None
+    license: Optional[str] = None
+    embargo: Optional[str] = None
+    reason: Optional[str] = None
+    at: Optional[str] = None
+
+
+class CorpusAppendOut(BaseModel):
+    act: str
+    #: whatever the library reported — ids, counts, the missing references it
+    #: refused to invent, its warnings. Passed through verbatim: this is a thin
+    #: adapter, and summarising a report is how a caller stops being able to see
+    #: that three of its four files were not there.
+    report: Dict[str, Any] = Field(default_factory=dict)
+    version: str = ""
+    #: who signed the act — the TOKEN's identity, never a field in the body
+    by: Optional[str] = None
+
+
+@v1.get("/corpus", response_model=CorpusOut, tags=["corpus"])
+def get_corpus(
+    sha256: Optional[List[str]] = Query(
+        default=None,
+        description="one or more digests: the answer is the part of the corpus "
+                    "that speaks about those files (repeat the parameter, or "
+                    "pass a comma-separated list)"),
+) -> CorpusOut:
+    """The instance's documentation — whole, or the slice a study needs.
+
+    A study cites a handful of assets out of a register that may hold thousands,
+    so the slice is not an optimisation: sending the whole corpus to draw four
+    nodes is what would make the resident corpus unusable for the client it
+    exists for. The slice keeps the chain around those files (the acquisition
+    that brought them in, the transformation that made them, their rights) —
+    reached by walking the DTC edges, because an acquisition without its licence
+    node would answer the rights question wrongly.
+    """
+    digests: List[str] = []
+    for raw in sha256 or []:
+        digests.extend(part.strip() for part in str(raw).split(",") if part.strip())
+    section = RESIDENT.read_slice(digests or None)
+    whole = RESIDENT.read()
+    return CorpusOut(
+        graph=section, version=canonical_digest(whole),
+        nodes=len(section.get("nodes") or []),
+        edges=len(section.get("edges") or []),
+        sliced=bool(digests), store=corpus_describe(CORPUS_STORE))
+
+
+@v1.post("/corpus/append", response_model=CorpusAppendOut, tags=["corpus"])
+def append_corpus(request: Request,
+                  act: CorpusAct = Body(...)) -> CorpusAppendOut:
+    """Perform one documentation act on the resident corpus.
+
+    **Who may**: any authenticated caller (the router's dependency). The corpus
+    is the register of what this instance's rooms are made of, and a person who
+    can log in and upload bytes can say where they came from — while the
+    ATTRIBUTOR is taken from the token, so nobody signs a statement in somebody
+    else's name. A finer rule (a role over the register) is a decision about
+    curation, not a line of code, and it is not invented here.
+
+    Idempotent, like the acts themselves: the same acquisition twice is one lot,
+    and a client that retries after a timeout does not double anything.
+    """
+    who = _caller(request)
+    # A RESIDENT file is one this instance HOLDS. Checking it here is what makes
+    # the register a description of the store rather than of somebody's intention:
+    # a digest nobody uploaded would sit in the corpus carrying a licence for
+    # bytes that are not there, and the asset gate would look it up for ever.
+    if str(act.act).strip().lower() == "resource":
+        residency = (act.residency or "resident").strip().lower()
+        ref = str(act.checksum or "")
+        if residency == "resident":
+            if not asset_ref_valid(ref):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"not an asset reference: {ref!r} (expected "
+                           f"'sha256:<hex>')")
+            if ASSET_STORE.head(ref) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no asset {ref} in this instance's store: register a "
+                           f"file after uploading it (or declare it "
+                           f"`residency: reference` if the bytes live elsewhere)")
+    try:
+        report, version = RESIDENT.append(act.act,
+                                         act.model_dump(exclude_none=True),
+                                         author=who)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except LookupError as exc:
+        # the library's way of saying "that file is not in here"
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    return CorpusAppendOut(act=act.act, report=report, version=version, by=who)
+
+
+@v1.post("/corpus/merge", response_model=CorpusAppendOut, tags=["corpus"])
+def merge_corpus_endpoint(request: Request,
+                          graph: Dict[str, Any] = Body(...)) -> CorpusAppendOut:
+    """Fold a project's **file** corpus into the resident one — the promote path.
+
+    Offline is not a lesser mode: a study documented on a laptop carries its DTC
+    inside its own em.json, and joining a room must bring that documentation with
+    it. Additive and per-UUID (`s3dgraphy.api.merge_corpus`, the container's own
+    merge), so promoting twice does not duplicate and two people who photographed
+    the same stone end up with one entry.
+
+    The body is the corpus **member section** (`{graph_id, nodes, edges, data}`),
+    or a container from which it is taken.
+    """
+    who = _caller(request)
+    section = graph
+    if isinstance(graph, dict) and isinstance(graph.get("graphs"), dict):
+        section = next((g for g in graph["graphs"].values()
+                        if isinstance(g, dict)
+                        and em.is_dtc_corpus(g)), None)
+        if section is None:
+            raise HTTPException(
+                status_code=400,
+                detail="this container has no DTC corpus member: nothing to merge "
+                       "(a member is a corpus by its `data.em_collection` marker, "
+                       "not by being called `dtc`)")
+    if not isinstance(section, dict) or "nodes" not in section:
+        raise HTTPException(status_code=400,
+                            detail="expected a corpus graph section with `nodes`")
+    report, version = RESIDENT.merge(section, author=who)
+    return CorpusAppendOut(act="merge", report=report, version=version, by=who)
 
 
 # ── IIIF · the authorisation the image server does not have ───────────────────
@@ -539,6 +856,11 @@ async def iiif_authz(request: Request, response: Response,
         checked = len(rooms_to_ask)
         for candidate in rooms_to_ask:
             await _rights_seen_anywhere(candidate, digest, request)
+    # …and the resident documentation, ONCE and even when no room mentions this
+    # picture at all: an image published from the register is still an image the
+    # register can embargo, and a gate that only looked at rooms would let it
+    # through precisely when nobody had opened the study.
+    await _corpus_gate(digest, request, door=room_id or None, room_rights=None)
     response.headers["X-EM-Authz"] = "ok"
     return {"ok": True, "digest": digest, "rooms_checked": checked}
 
@@ -559,6 +881,49 @@ def _digest_from_iiif_path(path: str) -> Optional[str]:
         if re.fullmatch(r"[0-9a-f]{64}", candidate.lower()):
             return candidate.lower()
     return None
+
+
+def _identity_of(request: Request) -> Optional[str]:
+    """The caller's ORCID from an OPTIONAL token, or None. Never an error: an
+    asset URL is fetched by things that cannot log in, and a stranger is a valid
+    answer to "who is this"."""
+    header = request.headers.get("authorization") or ""
+    token = request.query_params.get("token")
+    claims: Dict[str, Any] = {}
+    try:
+        if header.lower().startswith("bearer "):
+            claims = authenticator.require_token(request)
+        elif token:
+            claims = authenticator.verify(str(token).strip())
+    except Exception:  # noqa: BLE001 — a bad token is simply not an identity
+        claims = {}
+    if claims.get("em_dev_mode"):
+        return None
+    return (claims.get("orcid") or claims.get("preferred_username")
+            or claims.get("sub"))
+
+
+async def _role_without_bootstrap(room_id: str, orcid: Optional[str],
+                                  request: Request):
+    """The caller's role in a room, READING the grants and claiming none.
+
+    `ws.authorize` also performs the owner bootstrap — the first authenticated
+    arrival in an unowned room becomes its owner — which is right when somebody
+    opens a room they made and wrong as an authorisation check: it turns a room
+    name typed into a URL into a role. This is the read-only half: the ACL as
+    stored, plus the owner the STUDY declares, and nothing written back.
+    """
+    from . import access
+
+    acl = load_acl(room_id)
+    room = await rooms().get(room_id)
+    if acl.owner is None:
+        declared = access.owner_from_document(room.document)
+        if declared:
+            acl = Acl(owner=declared, members=acl.as_dict().get("members"),
+                      groups=acl.as_dict().get("groups"))
+    return access.role_of(acl, orcid, room.visibility, embargo=room.embargo,
+                          groups_of=groups().expander())
 
 
 def _rooms_holding(digest: str) -> List[str]:
